@@ -108,6 +108,45 @@ class WanVideoPipeline(BasePipeline):
         self.use_unified_sequence_parallel = True
 
 
+    def enable_block_sparse_attention(
+        self,
+        sparsity: float = 0.9,
+        block_size: tuple[int, int, int] = (2, 8, 8),
+        q_chunk_blocks: int = 16,
+        dense_fallback_threshold: int = 0,
+        debug: bool = False,
+        debug_layer: int = 0,
+        debug_head: int = 0,
+        debug_output: Optional[str] = None,
+    ):
+        from ..models.wan_video_dit import enable_wan_block_sparse_attention
+
+        if self.dit is not None:
+            enable_wan_block_sparse_attention(
+                self.dit,
+                sparsity=sparsity,
+                block_size=block_size,
+                q_chunk_blocks=q_chunk_blocks,
+                dense_fallback_threshold=dense_fallback_threshold,
+                debug=debug,
+                debug_layer=debug_layer,
+                debug_head=debug_head,
+                debug_output=debug_output,
+            )
+        if self.dit2 is not None:
+            enable_wan_block_sparse_attention(
+                self.dit2,
+                sparsity=sparsity,
+                block_size=block_size,
+                q_chunk_blocks=q_chunk_blocks,
+                dense_fallback_threshold=dense_fallback_threshold,
+                debug=debug,
+                debug_layer=debug_layer,
+                debug_head=debug_head,
+                debug_output=debug_output,
+            )
+
+
     @staticmethod
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,

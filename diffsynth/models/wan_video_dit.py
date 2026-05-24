@@ -130,8 +130,46 @@ class AttentionModule(nn.Module):
     def __init__(self, num_heads):
         super().__init__()
         self.num_heads = num_heads
+        self.grid_shape = None
+        self.block_sparse_config = None
+        self.block_sparse_layer_id = None
+        self.last_block_sparse_debug = None
         
     def forward(self, q, k, v):
+        if self.block_sparse_config is not None and self.grid_shape is not None:
+            from ..core.attention.block_sparse_3d import block_sparse_attention_3d, save_block_sparse_debug
+            config = self.block_sparse_config
+            dense_threshold = int(config.get("dense_fallback_threshold", 0))
+            if dense_threshold <= 0 or q.shape[1] > dense_threshold:
+                return_debug = bool(config.get("debug", False)) and (
+                    config.get("debug_layer", self.block_sparse_layer_id) == self.block_sparse_layer_id
+                )
+                result = block_sparse_attention_3d(
+                    q,
+                    k,
+                    v,
+                    grid_shape=self.grid_shape,
+                    block_size=config.get("block_size", (2, 8, 8)),
+                    num_heads=self.num_heads,
+                    sparsity=float(config.get("sparsity", 0.9)),
+                    q_chunk_blocks=int(config.get("q_chunk_blocks", 16)),
+                    return_debug=return_debug,
+                )
+                if return_debug:
+                    x, debug = result
+                    debug["layer_id"] = self.block_sparse_layer_id
+                    self.last_block_sparse_debug = debug
+                    debug_output = config.get("debug_output")
+                    if debug_output is not None:
+                        prefix = f"layer{self.block_sparse_layer_id}"
+                        save_block_sparse_debug(
+                            debug,
+                            debug_output,
+                            prefix=prefix,
+                            head=int(config.get("debug_head", 0)),
+                        )
+                    return x
+                return result
         x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
         return x
 
@@ -498,7 +536,14 @@ class WanModel(torch.nn.Module):
             y_camera = self.control_adapter(control_camera_latents_input)
             x = [u + v for u, v in zip(x, y_camera)]
             x = x[0].unsqueeze(0)
-        return x
+        grid_size = x.shape[2:]
+        if x.ndim == 5:
+            x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
+        elif x.ndim == 3:
+            x = rearrange(x, "b c f -> b f c").contiguous()
+        else:
+            raise ValueError(f"Unsupported patch embedding output shape: {tuple(x.shape)}")
+        return x, grid_size
 
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
         return rearrange(
@@ -535,7 +580,9 @@ class WanModel(torch.nn.Module):
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-        for block in self.blocks:
+        for block_id, block in enumerate(self.blocks):
+            block.self_attn.attn.grid_shape = (f, h, w)
+            block.self_attn.attn.block_sparse_layer_id = block_id
             if self.training:
                 x = gradient_checkpoint_forward(
                     block,
@@ -549,3 +596,35 @@ class WanModel(torch.nn.Module):
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
         return x
+
+
+def enable_wan_block_sparse_attention(
+    model: WanModel,
+    sparsity: float = 0.9,
+    block_size: Tuple[int, int, int] = (2, 8, 8),
+    q_chunk_blocks: int = 16,
+    dense_fallback_threshold: int = 0,
+    debug: bool = False,
+    debug_layer: int = 0,
+    debug_head: int = 0,
+    debug_output: Optional[str] = None,
+):
+    config = {
+        "sparsity": float(sparsity),
+        "block_size": tuple(int(x) for x in block_size),
+        "q_chunk_blocks": int(q_chunk_blocks),
+        "dense_fallback_threshold": int(dense_fallback_threshold),
+        "debug": bool(debug),
+        "debug_layer": int(debug_layer),
+        "debug_head": int(debug_head),
+        "debug_output": debug_output,
+    }
+    for layer_id, block in enumerate(model.blocks):
+        block.self_attn.attn.block_sparse_config = config
+        block.self_attn.attn.block_sparse_layer_id = layer_id
+
+
+def disable_wan_block_sparse_attention(model: WanModel):
+    for block in model.blocks:
+        block.self_attn.attn.block_sparse_config = None
+        block.self_attn.attn.last_block_sparse_debug = None

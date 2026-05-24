@@ -1,6 +1,7 @@
 import torch, os, argparse, accelerate, warnings
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
+from diffsynth.core.attention.block_sparse_schedule import parse_block_size
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -24,6 +25,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        enable_block_sparse_attn=False,
+        block_sparse_sparsity=0.9,
+        block_sparse_start_sparsity=None,
+        block_sparse_end_sparsity=None,
+        block_sparse_ramp_steps=0,
+        block_sparse_block_size="2,8,8",
+        block_sparse_q_chunk_blocks=2,
+        block_sparse_dense_fallback_threshold=0,
+        block_sparse_debug=False,
+        block_sparse_debug_layer=0,
+        block_sparse_debug_head=0,
+        block_sparse_debug_output=None,
     ):
         super().__init__()
         # Warning
@@ -46,6 +59,27 @@ class WanTrainingModule(DiffusionTrainingModule):
             preset_lora_path, preset_lora_model,
             task=task,
         )
+        block_sparse_block_size = parse_block_size(block_sparse_block_size)
+        self.block_sparse_training_config = {
+            "enabled": bool(enable_block_sparse_attn),
+            "sparsity": float(block_sparse_sparsity),
+            "start_sparsity": float(block_sparse_sparsity if block_sparse_start_sparsity is None else block_sparse_start_sparsity),
+            "end_sparsity": float(block_sparse_sparsity if block_sparse_end_sparsity is None else block_sparse_end_sparsity),
+            "ramp_steps": int(block_sparse_ramp_steps),
+            "block_size": block_sparse_block_size,
+            "q_chunk_blocks": int(block_sparse_q_chunk_blocks),
+        }
+        if enable_block_sparse_attn:
+            self.pipe.enable_block_sparse_attention(
+                sparsity=self.block_sparse_training_config["start_sparsity"],
+                block_size=block_sparse_block_size,
+                q_chunk_blocks=block_sparse_q_chunk_blocks,
+                dense_fallback_threshold=block_sparse_dense_fallback_threshold,
+                debug=block_sparse_debug,
+                debug_layer=block_sparse_debug_layer,
+                debug_head=block_sparse_debug_head,
+                debug_output=block_sparse_debug_output,
+            )
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -123,6 +157,18 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
+    parser.add_argument("--enable_block_sparse_attn", default=False, action="store_true", help="Enable PyTorch 3D block sparse self-attention for Wan DiT.")
+    parser.add_argument("--block_sparse_sparsity", type=float, default=0.9, help="Constant block sparse attention sparsity when no schedule is set.")
+    parser.add_argument("--block_sparse_start_sparsity", type=float, default=None, help="Initial sparsity for cosine ramp schedule.")
+    parser.add_argument("--block_sparse_end_sparsity", type=float, default=None, help="Final sparsity for cosine ramp schedule.")
+    parser.add_argument("--block_sparse_ramp_steps", type=int, default=0, help="Number of optimizer steps for cosine sparsity ramp.")
+    parser.add_argument("--block_sparse_block_size", type=str, default="2,8,8", help="3D block size formatted as block_t,block_h,block_w.")
+    parser.add_argument("--block_sparse_q_chunk_blocks", type=int, default=2, help="Query blocks per sparse attention chunk. Lower values reduce peak memory.")
+    parser.add_argument("--block_sparse_dense_fallback_threshold", type=int, default=0, help="Use dense attention below this token count. 0 disables fallback.")
+    parser.add_argument("--block_sparse_debug", default=False, action="store_true", help="Save block sparse debug masks during training.")
+    parser.add_argument("--block_sparse_debug_layer", type=int, default=0, help="Layer id for block sparse debug mask saving.")
+    parser.add_argument("--block_sparse_debug_head", type=int, default=0, help="Head id for block sparse debug mask saving.")
+    parser.add_argument("--block_sparse_debug_output", type=str, default=None, help="Directory for block sparse debug outputs.")
     return parser
 
 
@@ -178,10 +224,23 @@ if __name__ == "__main__":
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        enable_block_sparse_attn=args.enable_block_sparse_attn,
+        block_sparse_sparsity=args.block_sparse_sparsity,
+        block_sparse_start_sparsity=args.block_sparse_start_sparsity,
+        block_sparse_end_sparsity=args.block_sparse_end_sparsity,
+        block_sparse_ramp_steps=args.block_sparse_ramp_steps,
+        block_sparse_block_size=args.block_sparse_block_size,
+        block_sparse_q_chunk_blocks=args.block_sparse_q_chunk_blocks,
+        block_sparse_dense_fallback_threshold=args.block_sparse_dense_fallback_threshold,
+        block_sparse_debug=args.block_sparse_debug,
+        block_sparse_debug_layer=args.block_sparse_debug_layer,
+        block_sparse_debug_head=args.block_sparse_debug_head,
+        block_sparse_debug_output=args.block_sparse_debug_output,
     )
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        training_log_file=args.training_log_file,
     )
     launcher_map = {
         "sft:data_process": launch_data_process_task,

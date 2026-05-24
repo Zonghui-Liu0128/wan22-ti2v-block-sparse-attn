@@ -1,9 +1,52 @@
-import os, torch
+import os, time, torch
 from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
+from diffsynth.core.attention.block_sparse_schedule import (
+    collect_block_sparse_training_stats,
+    compute_sparsity_for_step,
+    update_block_sparse_sparsity,
+)
+
+
+def _count_batch_samples_and_frames(data, default_num_frames=None):
+    samples = 1
+    frames = default_num_frames
+    if isinstance(data, dict):
+        video = data.get("video")
+        if isinstance(video, (list, tuple)):
+            frames = len(video)
+        elif isinstance(video, torch.Tensor):
+            if video.ndim >= 4:
+                frames = int(video.shape[0])
+        elif frames is None:
+            frames = 0
+    elif frames is None:
+        frames = 0
+    return samples, int(frames)
+
+
+def _current_learning_rate(optimizer):
+    if len(optimizer.param_groups) == 0:
+        return None
+    return optimizer.param_groups[0].get("lr")
+
+
+def _update_sparse_schedule(model, step):
+    config = getattr(model, "block_sparse_training_config", None)
+    if config is None and hasattr(model, "module"):
+        config = getattr(model.module, "block_sparse_training_config", None)
+    if not config or not config.get("enabled", False):
+        return
+    sparsity = compute_sparsity_for_step(
+        step,
+        config.get("start_sparsity", config.get("sparsity", 0.9)),
+        config.get("end_sparsity", config.get("sparsity", 0.9)),
+        config.get("ramp_steps", 0),
+    )
+    update_block_sparse_sparsity(model, sparsity)
 
 
 def launch_training_task(
@@ -16,6 +59,7 @@ def launch_training_task(
     num_workers: int = 1,
     save_steps: int = None,
     num_epochs: int = 1,
+    max_train_steps: int = None,
     enable_model_cpu_offload: bool = False,
     enable_optimizer_cpu_offload: bool = False,
     cpu_offload_split_threshold: int = None,
@@ -27,6 +71,7 @@ def launch_training_task(
         num_workers = args.dataset_num_workers
         save_steps = args.save_steps
         num_epochs = args.num_epochs
+        max_train_steps = args.max_train_steps
         enable_model_cpu_offload = args.enable_model_cpu_offload
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
@@ -46,6 +91,10 @@ def launch_training_task(
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
+            if max_train_steps is not None and model_logger.num_steps >= max_train_steps:
+                break
+            step_start = time.perf_counter()
+            _update_sparse_schedule(model, model_logger.num_steps)
             with accelerator.accumulate(model):
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
@@ -57,7 +106,25 @@ def launch_training_task(
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-                model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                step_time = time.perf_counter() - step_start
+                batch_samples, batch_frames = _count_batch_samples_and_frames(
+                    data,
+                    default_num_frames=getattr(args, "num_frames", None),
+                )
+                model_logger.on_step_end(
+                    accelerator,
+                    model,
+                    save_steps,
+                    loss=loss,
+                    step_time=step_time,
+                    batch_samples=batch_samples,
+                    batch_frames=batch_frames,
+                    learning_rate=_current_learning_rate(optimizer),
+                    epoch=epoch_id,
+                    sparse_stats=collect_block_sparse_training_stats(model),
+                )
+        if max_train_steps is not None and model_logger.num_steps >= max_train_steps:
+            break
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 

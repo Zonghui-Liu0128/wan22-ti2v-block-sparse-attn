@@ -38,12 +38,14 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
+    parser.add_argument("--max_train_steps", type=int, default=None, help="Optional maximum number of optimizer steps.")
     return parser
 
 def add_output_config(parser: argparse.ArgumentParser):
     parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
     parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
+    parser.add_argument("--training_log_file", type=str, default=None, help="Path to JSONL training log. Defaults to output_path/training_log.jsonl.")
     return parser
 
 def add_lora_config(parser: argparse.ArgumentParser):

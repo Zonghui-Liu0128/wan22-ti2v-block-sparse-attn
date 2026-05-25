@@ -183,6 +183,45 @@ class BlockSparseAttention(nn.Module):
         self._dbg_video_shape = None     # (f, h, w)
         self._dbg_block_size = None      # (bt, bh, bw)
 
+    def _compute_block_info(
+        self, video_shape: Tuple[int, int, int], device: torch.device
+    ) -> dict:
+        f, h, w = video_shape
+        bt, bh, bw = self.block_size
+        # ceil-divide; we pad up to a multiple of block.
+        new_T = (f + bt - 1) // bt
+        new_H = (h + bh - 1) // bh
+        new_W = (w + bw - 1) // bw
+        F_pad = new_T * bt
+        H_pad = new_H * bh
+        W_pad = new_W * bw
+
+        # Effective real-token count along each axis per outer block index.
+        idx_t = torch.arange(new_T, device=device)
+        idx_h = torch.arange(new_H, device=device)
+        idx_w = torch.arange(new_W, device=device)
+        eff_t = torch.clamp(f - idx_t * bt, max=bt)   # (new_T,)
+        eff_h = torch.clamp(h - idx_h * bh, max=bh)   # (new_H,)
+        eff_w = torch.clamp(w - idx_w * bw, max=bw)   # (new_W,)
+
+        # Per-block real-token count, flattened in (t_out, h_out, w_out) raster.
+        count = (
+            eff_t[:, None, None] * eff_h[None, :, None] * eff_w[None, None, :]
+        ).reshape(-1).to(torch.long)
+
+        # Valid-token mask in padded volume (F_pad, H_pad, W_pad)
+        valid_mask = torch.zeros(F_pad, H_pad, W_pad, dtype=torch.bool, device=device)
+        valid_mask[:f, :h, :w] = True
+
+        return {
+            "pad_shape": (F_pad, H_pad, W_pad),
+            "new_grid": (new_T, new_H, new_W),
+            "num_blocks": new_T * new_H * new_W,
+            "block_size_total": bt * bh * bw,
+            "count": count,
+            "valid_mask": valid_mask,
+        }
+
     def forward(
         self,
         q: torch.Tensor,

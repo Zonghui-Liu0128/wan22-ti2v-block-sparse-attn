@@ -335,13 +335,20 @@ class BlockSparseAttention(nn.Module):
         keep_index = sort_idx[..., :num_keep]    # (B, n, num_blocks, num_keep) long
 
         # valid_mask per key token in block-contiguous layout.
-        # Q_blocked/K_blocked/V_blocked are in block-contiguous order (from _pad_and_permute).
-        # The dense reference uses valid_mask.reshape(-1) as a flat key-validity array
-        # applied at block-contiguous token position j (vm_raster[j] for key j).
-        # We mirror that here: reshape to (num_blocks, bst) so vm_blocked[b][t] ==
-        # vm_raster[b*bst + t], matching what the reference applies at the same index.
-        vm = info["valid_mask"].reshape(-1).to(device)         # (L_pad,) bool
-        vm_blocked = vm.reshape(num_blocks, bst)               # (num_blocks, bst) bool
+        # _pad_and_permute reorders padded raster (F_pad,H_pad,W_pad) into
+        # block-contiguous (num_blocks, block_size_total); apply the same rearrange to
+        # the bool validity mask so vm_blocked[block_idx, intra_idx] corresponds to the
+        # SAME spatial position as K_blocked[..., block_idx, intra_idx, :].
+        from einops import rearrange
+        F_pad, H_pad, W_pad = info["pad_shape"]
+        bt, bh, bw = self.block_size
+        nT, nH, nW = info["new_grid"]
+        vm_blocked = info["valid_mask"].to(device)             # (F_pad, H_pad, W_pad) bool
+        vm_blocked = rearrange(
+            vm_blocked,
+            "(tT bt) (hH bh) (wW bw) -> (tT hH wW) (bt bh bw)",
+            tT=nT, hH=nH, wW=nW, bt=bt, bh=bh, bw=bw,
+        )                                                       # (num_blocks, bst) bool
 
         out = torch.zeros_like(Q_blocked)
         chunk_size = max(1, min(self.chunk_size, num_blocks))

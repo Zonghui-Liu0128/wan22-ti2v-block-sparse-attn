@@ -218,9 +218,20 @@ def _dense_masked_attention(
     attend_token = attend_block[
         :, :, block_id.unsqueeze(1), block_id.unsqueeze(0)
     ]  # (B, n, L_pad, L_pad)
-    # Mask out padded key positions everywhere
-    vm = info["valid_mask"].reshape(-1)  # (L_pad,) bool
-    attend_token = attend_token & vm.view(1, 1, 1, L_pad)
+    # Mask out padded key positions everywhere. Q_flat/K_flat are in block-contiguous
+    # order, so we need valid_mask flattened in the SAME order.
+    from einops import rearrange
+    F_pad, H_pad, W_pad = info["pad_shape"]
+    nT_, nH_, nW_ = info["new_grid"]
+    bt_ = F_pad // nT_
+    bh_ = H_pad // nH_
+    bw_ = W_pad // nW_
+    vm_bc = rearrange(
+        info["valid_mask"],
+        "(tT bt) (hH bh) (wW bw) -> (tT hH wW bt bh bw)",
+        tT=nT_, hH=nH_, wW=nW_, bt=bt_, bh=bh_, bw=bw_,
+    )  # (L_pad,) bool, block-contiguous
+    attend_token = attend_token & vm_bc.view(1, 1, 1, L_pad)
     out_flat = F.scaled_dot_product_attention(
         Q_flat, K_flat, V_flat, attn_mask=attend_token
     )

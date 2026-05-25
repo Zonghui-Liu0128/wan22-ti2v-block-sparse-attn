@@ -60,18 +60,19 @@ def _build_attend_token(attend_block, block_ids):
 
 
 def _plot_token_attend(attend_token, f, h, w, bt, bh, bw, title, path, label_step=None):
-    """Render an L_real x L_real bool matrix; thin grid per token, thick grid at block
-    boundaries; block-id labels in cell centres."""
+    """Render an L_real x L_real bool matrix; thin grid per token (when L<=80),
+    thick grid at block boundaries."""
     L = attend_token.shape[0]
     arr = attend_token.cpu().numpy().astype(np.uint8)
     fig_size = max(6, min(18, L * 0.18))
     fig, ax = plt.subplots(figsize=(fig_size, fig_size))
     ax.imshow(arr, cmap=CMAP, vmin=0, vmax=1, interpolation="nearest")
 
-    # Thin per-token grid
-    ax.set_xticks(np.arange(-0.5, L, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, L, 1), minor=True)
-    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.2)
+    # Thin per-token grid — skip when too dense to read
+    if L <= 80:
+        ax.set_xticks(np.arange(-0.5, L, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, L, 1), minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=0.2)
 
     # Thick grid at block boundaries.
     # Real-token block boundaries:
@@ -109,24 +110,40 @@ def _plot_token_attend(attend_token, f, h, w, bt, bh, bw, title, path, label_ste
     ax.set_xlabel("key token index")
     ax.set_ylabel("query token index")
 
-    # Block centre labels
-    new_T = (f + bt - 1) // bt
-    new_H = (h + bh - 1) // bh
-    new_W = (w + bw - 1) // bw
-    for i in range(len(boundary_positions) - 1):
-        lo = boundary_positions[i]
-        hi = boundary_positions[i + 1]
-        c = (lo + hi - 1) / 2
-        # Reconstruct (t_out, h_out, w_out) from the first token in this block
-        t = lo // (h * w)
-        hh = (lo // w) % h
-        ww = lo % w
-        t_out, h_out, w_out = t // bt, hh // bh, ww // bw
-        # Same label on x and y for each diagonal block (skip per non-diag axes)
-        ax.text(c, -1.0, f"{t_out},{h_out},{w_out}", ha="center", va="bottom",
-                fontsize=6, color="black")
+    ax.set_title(title, fontsize=10, pad=12)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
-    ax.set_title(title, fontsize=10)
+
+def _plot_token_attend_block_contiguous(
+    attend_token_bc, real_per_block, num_blocks, title, path,
+):
+    """attend_token_bc: (L_real, L_real) bool, where rows/cols are ordered so each block's
+    real tokens are contiguous. real_per_block: (num_blocks,) long with the count of real
+    tokens per block. Block boundaries fall at cumulative-count positions."""
+    L = attend_token_bc.shape[0]
+    arr = attend_token_bc.cpu().numpy().astype(np.uint8)
+    fig_size = max(6, min(18, L * 0.18))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    ax.imshow(arr, cmap=CMAP, vmin=0, vmax=1, interpolation="nearest")
+
+    # Cumulative real-token positions = block boundaries.
+    cum = np.concatenate([[0], np.cumsum(real_per_block.cpu().numpy().astype(int))])
+    # Thick black grid at block boundaries (excluding the outermost edges already drawn by imshow).
+    for pos in cum:
+        ax.axvline(pos - 0.5, color="black", linewidth=1.0)
+        ax.axhline(pos - 0.5, color="black", linewidth=1.0)
+
+    # Centre block index on each axis.
+    block_centres = (cum[:-1] + cum[1:] - 1) / 2.0
+    ax.set_xticks(block_centres)
+    ax.set_yticks(block_centres)
+    ax.set_xticklabels([str(i) for i in range(num_blocks)], fontsize=7)
+    ax.set_yticklabels([str(i) for i in range(num_blocks)], fontsize=7)
+    ax.set_xlabel("key block index (each cell width = real tokens in that block)")
+    ax.set_ylabel("query block index (each cell height = real tokens in that block)")
+    ax.set_title(title, fontsize=10, pad=12)
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -233,12 +250,26 @@ def _run_scene(scene_name, f, h, w, block, sparse_ratio, backend, num_heads=2, d
         f"num_blocks={num_blocks}  K_drop={K_drop}  backend={backend}  head=0 batch=0"
     )
 
+    # Block-contiguous permutation: sort real tokens by their block id (stable).
+    perm = torch.argsort(block_ids_real, stable=True)
+    attend_token_bc = attend_token[perm][:, perm]
+    # Real tokens per block (boundary blocks have fewer).
+    real_per_block = info["count"]
+    # (Sanity) sum of real_per_block should equal L_real
+    assert int(real_per_block.sum().item()) == attend_token_bc.shape[0]
+
     # token-level: skip if too large
-    if attend_token.shape[0] <= 256:
+    L_real = attend_token.shape[0]
+    if L_real <= 256:
         _plot_token_attend(
             attend_token, f, h, w, bt, bh, bw,
             f"[{scene_name}] token-level attend  {title_common}",
             VIZ_DIR / f"wan_bsa_{scene_name}_{backend}_token.png",
+        )
+        _plot_token_attend_block_contiguous(
+            attend_token_bc, real_per_block, num_blocks,
+            f"[{scene_name}] token-level attend (block-contiguous)  {title_common}",
+            VIZ_DIR / f"wan_bsa_{scene_name}_{backend}_token_bc.png",
         )
     # block-level: always
     _plot_block_attend(

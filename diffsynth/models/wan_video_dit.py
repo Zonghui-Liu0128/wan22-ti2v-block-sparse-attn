@@ -453,7 +453,46 @@ class BlockSparseAttention(nn.Module):
         v: torch.Tensor,
         video_shape: Tuple[int, int, int],
     ) -> torch.Tensor:
-        raise NotImplementedError("forward implemented in later tasks")
+        from einops import rearrange
+        B, L, nd = q.shape
+        n = self.num_heads
+        d = nd // n
+        f, h, w = video_shape
+        assert L == f * h * w, f"L={L} != f*h*w={f*h*w}"
+        device = q.device
+
+        q_nd = rearrange(q, "b l (n d) -> b n l d", n=n)
+        k_nd = rearrange(k, "b l (n d) -> b n l d", n=n)
+        v_nd = rearrange(v, "b l (n d) -> b n l d", n=n)
+
+        info = self._compute_block_info(video_shape, device=device)
+        Q_b = self._pad_and_permute(q_nd, video_shape, info)
+        K_b = self._pad_and_permute(k_nd, video_shape, info)
+        V_b = self._pad_and_permute(v_nd, video_shape, info)
+        Q_mean = self._block_mean(Q_b, info)
+        K_mean = self._block_mean(K_b, info)
+        attend_block = self._compute_attend_block(Q_mean, K_mean)
+
+        if self.backend == "flex":
+            out_b = self._sparse_attn_flex(Q_b, K_b, V_b, attend_block, info)
+        elif self.backend == "sdpa_chunked":
+            out_b = self._sparse_attn_sdpa_chunked(Q_b, K_b, V_b, attend_block, info)
+        else:  # already asserted in __init__, kept for safety
+            raise ValueError(f"Unknown backend: {self.backend}")
+
+        out_nd = self._inverse_permute_and_crop(out_b, video_shape, info)
+        out = rearrange(out_nd, "b n l d -> b l (n d)").contiguous()
+
+        if self._debug_record:
+            self._dbg_attend_block = attend_block.detach()
+            self._dbg_top_index = getattr(self, "_last_top_index", None)
+            self._dbg_count = info["count"].detach()
+            self._dbg_valid_mask = info["valid_mask"].detach()
+            self._dbg_pad_shape = info["pad_shape"]
+            self._dbg_video_shape = tuple(video_shape)
+            self._dbg_block_size = tuple(self.block_size)
+
+        return out
 
 
 class SelfAttention(nn.Module):

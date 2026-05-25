@@ -350,3 +350,75 @@ def test_flex_backend_matches_sdpa_chunked_boundary():
     out_sdpa_real = m_sdpa._inverse_permute_and_crop(out_sdpa_full, (f, h, w), info)
     out_flex_real = m_flex._inverse_permute_and_crop(out_flex_full, (f, h, w), info)
     assert torch.allclose(out_sdpa_real, out_flex_real, atol=2e-4, rtol=1e-4)
+
+
+# --- end-to-end BlockSparseAttention.forward -------------------------------
+
+
+def test_forward_end_to_end_clean_sdpa_chunked():
+    torch.manual_seed(10)
+    num_heads, d = 2, 4
+    block = (2, 2, 2)
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    B = 1
+    q = torch.randn(B, L, num_heads * d, dtype=torch.float32)
+    k = torch.randn(B, L, num_heads * d, dtype=torch.float32)
+    v = torch.randn(B, L, num_heads * d, dtype=torch.float32)
+    m = _make_bsa(num_heads=num_heads, block=block, sparse_ratio=0.5, backend="sdpa_chunked")
+    m._debug_record = True
+    out = m(q, k, v, (f, h, w))
+    assert out.shape == (B, L, num_heads * d)
+    # Debug hooks captured
+    assert m._dbg_attend_block is not None
+    assert m._dbg_video_shape == (f, h, w)
+    assert m._dbg_block_size == block
+
+    # Independent reference: same lifted-mask SDPA on (B, n, L, d) layout
+    from einops import rearrange
+    q_nd = rearrange(q, "b l (n d) -> b n l d", n=num_heads)
+    k_nd = rearrange(k, "b l (n d) -> b n l d", n=num_heads)
+    v_nd = rearrange(v, "b l (n d) -> b n l d", n=num_heads)
+    info = m._compute_block_info((f, h, w), device=q.device)
+    Q_b = m._pad_and_permute(q_nd, (f, h, w), info)
+    K_b = m._pad_and_permute(k_nd, (f, h, w), info)
+    V_b = m._pad_and_permute(v_nd, (f, h, w), info)
+    Q_mean = m._block_mean(Q_b, info)
+    K_mean = m._block_mean(K_b, info)
+    attend_block = m._compute_attend_block(Q_mean, K_mean)
+    out_ref_blocked = _dense_masked_attention(Q_b, K_b, V_b, attend_block, info)
+    out_ref_nd = m._inverse_permute_and_crop(out_ref_blocked, (f, h, w), info)
+    out_ref = rearrange(out_ref_nd, "b n l d -> b l (n d)")
+    assert torch.allclose(out, out_ref, atol=1e-5)
+
+
+def test_forward_end_to_end_boundary_sdpa_chunked():
+    torch.manual_seed(11)
+    num_heads, d = 2, 4
+    block = (2, 2, 2)
+    f, h, w = 3, 4, 5
+    L = f * h * w
+    B = 1
+    q = torch.randn(B, L, num_heads * d, dtype=torch.float32)
+    k = torch.randn(B, L, num_heads * d, dtype=torch.float32)
+    v = torch.randn(B, L, num_heads * d, dtype=torch.float32)
+    m = _make_bsa(num_heads=num_heads, block=block, sparse_ratio=0.5, backend="sdpa_chunked")
+    out = m(q, k, v, (f, h, w))
+    assert out.shape == (B, L, num_heads * d)
+
+    # Independent reference (same as above)
+    from einops import rearrange
+    q_nd = rearrange(q, "b l (n d) -> b n l d", n=num_heads)
+    k_nd = rearrange(k, "b l (n d) -> b n l d", n=num_heads)
+    v_nd = rearrange(v, "b l (n d) -> b n l d", n=num_heads)
+    info = m._compute_block_info((f, h, w), device=q.device)
+    Q_b = m._pad_and_permute(q_nd, (f, h, w), info)
+    K_b = m._pad_and_permute(k_nd, (f, h, w), info)
+    V_b = m._pad_and_permute(v_nd, (f, h, w), info)
+    Q_mean = m._block_mean(Q_b, info)
+    K_mean = m._block_mean(K_b, info)
+    attend_block = m._compute_attend_block(Q_mean, K_mean)
+    out_ref_blocked = _dense_masked_attention(Q_b, K_b, V_b, attend_block, info)
+    out_ref_nd = m._inverse_permute_and_crop(out_ref_blocked, (f, h, w), info)
+    out_ref = rearrange(out_ref_nd, "b n l d -> b l (n d)")
+    assert torch.allclose(out, out_ref, atol=1e-5)

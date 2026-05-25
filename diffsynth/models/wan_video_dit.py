@@ -25,8 +25,17 @@ try:
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-    
-    
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_attention
+    from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
+    FLEX_ATTN_AVAILABLE = True
+except ImportError:
+    FLEX_ATTN_AVAILABLE = False
+    _flex_attention = None
+    _create_block_mask = None
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -130,10 +139,58 @@ class AttentionModule(nn.Module):
     def __init__(self, num_heads):
         super().__init__()
         self.num_heads = num_heads
-        
+
     def forward(self, q, k, v):
         x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
         return x
+
+
+class BlockSparseAttention(nn.Module):
+    """Block Sparse Attention used by SelfAttention when bsa_enable=True.
+
+    Algorithm mirrors template_BSA.py: pad the (f,h,w) volume to block-aligned size,
+    rearrange so tokens within the same spatial block are contiguous, compute a
+    weighted block-mean of Q/K (boundary blocks normalised by real-token count so
+    similarity/top-K precision is unaffected), pick top-K least-similar key blocks
+    per query block to *drop* (sparse_ratio == drop fraction), then attend only
+    over the surviving block pairs and crop padding away.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        block_size: Tuple[int, int, int],
+        sparse_ratio: float,
+        backend: str = "flex",
+        chunk_size: int = 64,
+    ):
+        super().__init__()
+        assert backend in ("flex", "sdpa_chunked"), f"Unknown BSA backend: {backend}"
+        assert 0.0 <= sparse_ratio < 1.0, "sparse_ratio must lie in [0, 1)"
+        self.num_heads = num_heads
+        self.block_size = tuple(block_size)
+        self.sparse_ratio = float(sparse_ratio)
+        self.backend = backend
+        self.chunk_size = chunk_size
+
+        # Debug hook — flip to True from outside to capture intermediates.
+        self._debug_record: bool = False
+        self._dbg_attend_block = None    # (B, n, num_blocks, num_blocks) bool
+        self._dbg_top_index = None       # (B, n, num_blocks, K_drop) long
+        self._dbg_count = None           # (num_blocks,) long
+        self._dbg_valid_mask = None      # (F_pad, H_pad, W_pad) bool
+        self._dbg_pad_shape = None       # (F_pad, H_pad, W_pad)
+        self._dbg_video_shape = None     # (f, h, w)
+        self._dbg_block_size = None      # (bt, bh, bw)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        video_shape: Tuple[int, int, int],
+    ) -> torch.Tensor:
+        raise NotImplementedError("forward implemented in later tasks")
 
 
 class SelfAttention(nn.Module):

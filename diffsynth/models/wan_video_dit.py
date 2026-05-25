@@ -496,7 +496,16 @@ class BlockSparseAttention(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        bsa_enable: bool = False,
+        bsa_block_size: Tuple[int, int, int] = (2, 2, 2),
+        bsa_sparse_ratio: float = 0.5,
+        bsa_backend: str = "flex",
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -508,16 +517,29 @@ class SelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = RMSNorm(dim, eps=eps)
         self.norm_k = RMSNorm(dim, eps=eps)
-        
-        self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+        self.bsa_enable = bsa_enable
+        if bsa_enable:
+            self.attn = BlockSparseAttention(
+                num_heads=num_heads,
+                block_size=bsa_block_size,
+                sparse_ratio=bsa_sparse_ratio,
+                backend=bsa_backend,
+            )
+        else:
+            self.attn = AttentionModule(self.num_heads)
+
+    def forward(self, x, freqs, video_shape: Optional[Tuple[int, int, int]] = None):
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
         q = rope_apply(q, freqs, self.num_heads)
         k = rope_apply(k, freqs, self.num_heads)
-        x = self.attn(q, k, v)
+        if self.bsa_enable:
+            assert video_shape is not None, "video_shape required when bsa_enable=True"
+            x = self.attn(q, k, v, video_shape=video_shape)
+        else:
+            x = self.attn(q, k, v)
         return self.o(x)
 
 

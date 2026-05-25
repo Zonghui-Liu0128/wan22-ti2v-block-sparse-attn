@@ -422,3 +422,70 @@ def test_forward_end_to_end_boundary_sdpa_chunked():
     out_ref_nd = m._inverse_permute_and_crop(out_ref_blocked, (f, h, w), info)
     out_ref = rearrange(out_ref_nd, "b n l d -> b l (n d)")
     assert torch.allclose(out, out_ref, atol=1e-5)
+
+
+# --- SelfAttention integration ---------------------------------------------
+
+from diffsynth.models.wan_video_dit import SelfAttention, AttentionModule
+
+
+def test_self_attention_default_unchanged_uses_attention_module():
+    sa = SelfAttention(dim=8, num_heads=2)
+    assert isinstance(sa.attn, AttentionModule)
+
+
+def test_self_attention_bsa_uses_block_sparse_module():
+    sa = SelfAttention(
+        dim=8, num_heads=2,
+        bsa_enable=True, bsa_block_size=(2, 2, 2),
+        bsa_sparse_ratio=0.5, bsa_backend="sdpa_chunked",
+    )
+    assert isinstance(sa.attn, BlockSparseAttention)
+    assert sa.attn.block_size == (2, 2, 2)
+    assert sa.attn.sparse_ratio == 0.5
+    assert sa.attn.backend == "sdpa_chunked"
+
+
+def test_self_attention_forward_bsa_disabled_matches_pre_bsa_path():
+    """With bsa_enable=False, forward must take the AttentionModule path; video_shape ignored."""
+    torch.manual_seed(12)
+    dim = 16
+    num_heads = 2
+    L = 8
+    sa = SelfAttention(dim=dim, num_heads=num_heads)
+    sa.eval()
+    x = torch.randn(1, L, dim)
+    # Build a dummy freqs tensor matching the precompute_freqs_cis layout:
+    # rope_apply consumes complex64 freqs of shape (L, 1, d_head/2).
+    head_dim = dim // num_heads
+    freqs = torch.polar(
+        torch.ones(L, 1, head_dim // 2),
+        torch.zeros(L, 1, head_dim // 2),
+    )
+    out_no_vs = sa(x, freqs)
+    out_with_vs = sa(x, freqs, video_shape=(2, 2, 2))
+    # Passing video_shape on a disabled BSA must not change output.
+    assert torch.equal(out_no_vs, out_with_vs)
+
+
+def test_self_attention_forward_bsa_enabled_runs():
+    """With bsa_enable=True, forward must accept video_shape and produce a tensor of the right shape."""
+    torch.manual_seed(13)
+    dim = 16
+    num_heads = 2
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    sa = SelfAttention(
+        dim=dim, num_heads=num_heads,
+        bsa_enable=True, bsa_block_size=(2, 2, 2),
+        bsa_sparse_ratio=0.5, bsa_backend="sdpa_chunked",
+    )
+    sa.eval()
+    x = torch.randn(1, L, dim)
+    head_dim = dim // num_heads
+    freqs = torch.polar(
+        torch.ones(L, 1, head_dim // 2),
+        torch.zeros(L, 1, head_dim // 2),
+    )
+    out = sa(x, freqs, video_shape=(f, h, w))
+    assert out.shape == x.shape

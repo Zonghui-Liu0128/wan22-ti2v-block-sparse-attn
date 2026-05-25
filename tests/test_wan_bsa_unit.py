@@ -159,3 +159,40 @@ def test_block_mean_boundary_is_unbiased_real_token_mean():
                 expected[:, :, block_idx, :] = sub.reshape(B, n, cnt, d).mean(dim=2)
                 block_idx += 1
     assert torch.allclose(mean_weighted, expected, atol=1e-5)
+
+
+# --- attend_block construction ---------------------------------------------
+
+
+def test_attend_block_drops_least_similar():
+    """sparse_ratio == drop fraction; (-sim).topk(K_drop) selects the K_drop SMALLEST sim
+    values per row, those positions must be False in attend_block. The rest must be True.
+    """
+    torch.manual_seed(4)
+    m = _make_bsa(num_heads=1, block=(2, 2, 2), sparse_ratio=0.5)
+    B, n, num_blocks, d = 1, 1, 8, 4
+    Q_block = torch.randn(B, n, num_blocks, d)
+    K_block = torch.randn(B, n, num_blocks, d)
+    attend_block = m._compute_attend_block(Q_block, K_block)
+    assert attend_block.shape == (B, n, num_blocks, num_blocks)
+    assert attend_block.dtype == torch.bool
+
+    sim = Q_block @ K_block.transpose(-1, -2)
+    K_drop = int(num_blocks * 0.5)
+    assert ((~attend_block).sum(dim=-1) == K_drop).all()
+    for i in range(num_blocks):
+        # The K_drop smallest sim values must correspond to attend_block == False
+        row_sim = sim[0, 0, i]
+        sorted_idx = row_sim.argsort()
+        drop_set = set(sorted_idx[:K_drop].tolist())
+        false_set = set((~attend_block[0, 0, i]).nonzero(as_tuple=True)[0].tolist())
+        assert drop_set == false_set
+
+
+def test_attend_block_sparse_ratio_zero_keeps_everything():
+    m = _make_bsa(num_heads=1, block=(2, 2, 2), sparse_ratio=0.0)
+    torch.manual_seed(5)
+    Q_block = torch.randn(1, 1, 6, 4)
+    K_block = torch.randn(1, 1, 6, 4)
+    attend_block = m._compute_attend_block(Q_block, K_block)
+    assert attend_block.all()

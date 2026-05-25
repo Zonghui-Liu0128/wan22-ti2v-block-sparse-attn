@@ -285,6 +285,27 @@ class BlockSparseAttention(nn.Module):
         count_f = count.to(dtype=blocked.dtype).view(1, 1, -1, 1)
         return blocked.sum(dim=-2) / count_f
 
+    def _compute_attend_block(
+        self,
+        Q_block: torch.Tensor,
+        K_block: torch.Tensor,
+    ) -> torch.Tensor:
+        """Block-level similarity then drop K_drop = floor(num_blocks * sparse_ratio)
+        least-similar key blocks per query block. Returns (B, n, num_blocks, num_blocks)
+        bool where True=attend.
+        """
+        sim = Q_block @ K_block.transpose(-1, -2)             # (B, n, num_blocks, num_blocks)
+        B, n, num_blocks, _ = sim.shape
+        K_drop = int(num_blocks * self.sparse_ratio)
+        attend = torch.ones(B, n, num_blocks, num_blocks, dtype=torch.bool, device=sim.device)
+        if K_drop > 0:
+            top_index = (-sim).topk(K_drop, dim=-1).indices    # (B, n, num_blocks, K_drop) long
+            attend.scatter_(-1, top_index, False)
+            self._last_top_index = top_index  # used for sdpa_chunked backend later
+        else:
+            self._last_top_index = None
+        return attend
+
     def forward(
         self,
         q: torch.Tensor,

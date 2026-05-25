@@ -391,6 +391,61 @@ class BlockSparseAttention(nn.Module):
             out[:, :, chunk_start:chunk_end] = out_chunk.reshape(B, c, n, bst, d).permute(0, 2, 1, 3, 4)
         return out.to(dtype=dtype)
 
+    def _sparse_attn_flex(
+        self,
+        Q_blocked: torch.Tensor,
+        K_blocked: torch.Tensor,
+        V_blocked: torch.Tensor,
+        attend_block: torch.Tensor,
+        info: dict,
+    ) -> torch.Tensor:
+        """FlexAttention sparse path. Returns (B, n, num_blocks, block_size_total, d)."""
+        if not FLEX_ATTN_AVAILABLE:
+            raise RuntimeError(
+                "FlexAttention not available — install PyTorch >= 2.5 or switch backend='sdpa_chunked'."
+            )
+        B, n, num_blocks, bst, d = Q_blocked.shape
+        L_pad = num_blocks * bst
+        device = Q_blocked.device
+
+        # Permuted padded sequence view: (B, n, L_pad, d)
+        Q_perm = Q_blocked.reshape(B, n, L_pad, d).contiguous()
+        K_perm = K_blocked.reshape(B, n, L_pad, d).contiguous()
+        V_perm = V_blocked.reshape(B, n, L_pad, d).contiguous()
+
+        # Valid token mask in block-contiguous (permuted) order.
+        F_pad, H_pad, W_pad = info["pad_shape"]
+        bt, bh, bw = self.block_size
+        nT, nH, nW = info["new_grid"]
+        from einops import rearrange
+        vm = info["valid_mask"].to(device)
+        vm_perm = rearrange(
+            vm,
+            "(tT bt) (hH bh) (wW bw) -> (tT hH wW bt bh bw)",
+            tT=nT, hH=nH, wW=nW, bt=bt, bh=bh, bw=bw,
+        ).contiguous()                                       # (L_pad,) bool
+
+        # FlexAttention kernel BLOCK_SIZE must be a multiple of 16 (typical kernel constraint).
+        # We pick the smallest multiple of 16 that is >= block_size_total.
+        kernel_block_size = max(16, ((bst + 15) // 16) * 16)
+
+        def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+            q_block = q_idx // bst
+            kv_block = kv_idx // bst
+            return attend_block[b_idx, h_idx, q_block, kv_block] & vm_perm[kv_idx]
+
+        block_mask = _create_block_mask(
+            mask_mod,
+            B=B,
+            H=n,
+            Q_LEN=L_pad,
+            KV_LEN=L_pad,
+            device=device,
+            BLOCK_SIZE=kernel_block_size,
+        )
+        out_perm = _flex_attention(Q_perm, K_perm, V_perm, block_mask=block_mask)
+        return out_perm.view(B, n, num_blocks, bst, d)
+
     def forward(
         self,
         q: torch.Tensor,

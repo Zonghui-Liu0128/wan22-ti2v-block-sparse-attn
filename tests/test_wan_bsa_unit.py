@@ -285,3 +285,68 @@ def test_sdpa_chunked_backend_matches_dense_reference_boundary():
     out_bsa_real = m._inverse_permute_and_crop(out_bsa, (f, h, w), info)
     out_ref_real = m._inverse_permute_and_crop(out_ref, (f, h, w), info)
     assert torch.allclose(out_bsa_real, out_ref_real, atol=1e-5)
+
+
+# --- flex backend cross-check (CUDA + flex_attention only) ------------------
+
+from diffsynth.models.wan_video_dit import FLEX_ATTN_AVAILABLE
+
+
+_flex_skip_reason = "FlexAttention or CUDA unavailable"
+_flex_skip = pytest.mark.skipif(
+    not (FLEX_ATTN_AVAILABLE and torch.cuda.is_available()),
+    reason=_flex_skip_reason,
+)
+
+
+@_flex_skip
+def test_flex_backend_matches_sdpa_chunked_clean():
+    torch.manual_seed(8)
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    device = torch.device("cuda")
+    B, n, d = 1, 2, 4
+    q = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
+    k = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
+    v = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
+    m_sdpa = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked").to(device)
+    m_flex = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="flex").to(device)
+
+    info = m_sdpa._compute_block_info((f, h, w), device=device)
+    Q_b = m_sdpa._pad_and_permute(q, (f, h, w), info)
+    K_b = m_sdpa._pad_and_permute(k, (f, h, w), info)
+    V_b = m_sdpa._pad_and_permute(v, (f, h, w), info)
+    Q_mean = m_sdpa._block_mean(Q_b, info)
+    K_mean = m_sdpa._block_mean(K_b, info)
+    attend_block = m_sdpa._compute_attend_block(Q_mean, K_mean)
+    out_sdpa = m_sdpa._sparse_attn_sdpa_chunked(Q_b, K_b, V_b, attend_block, info)
+    out_flex = m_flex._sparse_attn_flex(Q_b, K_b, V_b, attend_block, info)
+    # FlexAttention may use different reductions; allow slightly larger tolerance.
+    assert torch.allclose(out_sdpa, out_flex, atol=2e-4, rtol=1e-4)
+
+
+@_flex_skip
+def test_flex_backend_matches_sdpa_chunked_boundary():
+    torch.manual_seed(9)
+    f, h, w = 3, 4, 5
+    L = f * h * w
+    device = torch.device("cuda")
+    B, n, d = 1, 2, 4
+    q = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
+    k = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
+    v = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
+    m_sdpa = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked").to(device)
+    m_flex = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="flex").to(device)
+    info = m_sdpa._compute_block_info((f, h, w), device=device)
+    Q_b = m_sdpa._pad_and_permute(q, (f, h, w), info)
+    K_b = m_sdpa._pad_and_permute(k, (f, h, w), info)
+    V_b = m_sdpa._pad_and_permute(v, (f, h, w), info)
+    Q_mean = m_sdpa._block_mean(Q_b, info)
+    K_mean = m_sdpa._block_mean(K_b, info)
+    attend_block = m_sdpa._compute_attend_block(Q_mean, K_mean)
+    out_sdpa_full = m_sdpa._sparse_attn_sdpa_chunked(Q_b, K_b, V_b, attend_block, info)
+    out_flex_full = m_flex._sparse_attn_flex(Q_b, K_b, V_b, attend_block, info)
+    # Only compare on real tokens
+    out_sdpa_real = m_sdpa._inverse_permute_and_crop(out_sdpa_full, (f, h, w), info)
+    out_flex_real = m_flex._inverse_permute_and_crop(out_flex_full, (f, h, w), info)
+    assert torch.allclose(out_sdpa_real, out_flex_real, atol=2e-4, rtol=1e-4)

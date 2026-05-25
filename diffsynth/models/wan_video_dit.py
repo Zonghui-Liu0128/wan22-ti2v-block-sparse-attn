@@ -306,6 +306,84 @@ class BlockSparseAttention(nn.Module):
             self._last_top_index = None
         return attend
 
+    def _sparse_attn_sdpa_chunked(
+        self,
+        Q_blocked: torch.Tensor,
+        K_blocked: torch.Tensor,
+        V_blocked: torch.Tensor,
+        attend_block: torch.Tensor,
+        info: dict,
+    ) -> torch.Tensor:
+        """Chunked sparse attention using SDPA per query-block chunk.
+
+        Inputs are block-contiguous: (B, n, num_blocks, block_size_total, d).
+        For each query block i, gather its kept key blocks and run SDPA;
+        the kept set is derived from attend_block (True == keep).
+        Returns (B, n, num_blocks, block_size_total, d).
+        """
+        B, n, num_blocks, bst, d = Q_blocked.shape
+        device = Q_blocked.device
+        dtype = Q_blocked.dtype
+        # num_keep is uniform across rows because we always drop exactly K_drop.
+        K_drop = int(num_blocks * self.sparse_ratio)
+        num_keep = num_blocks - K_drop
+
+        # keep_index: (B, n, num_blocks, num_keep) long — the kept key-block indices per query.
+        # Sort attend_block (bool) descending so True comes first, take first num_keep.
+        # attend_block True == keep; sort by attend along last dim (largest first).
+        _, sort_idx = attend_block.to(torch.int8).sort(dim=-1, descending=True, stable=True)
+        keep_index = sort_idx[..., :num_keep]    # (B, n, num_blocks, num_keep) long
+
+        # valid_mask per key token in block-contiguous layout.
+        # Q_blocked/K_blocked/V_blocked are in block-contiguous order (from _pad_and_permute).
+        # The dense reference uses valid_mask.reshape(-1) as a flat key-validity array
+        # applied at block-contiguous token position j (vm_raster[j] for key j).
+        # We mirror that here: reshape to (num_blocks, bst) so vm_blocked[b][t] ==
+        # vm_raster[b*bst + t], matching what the reference applies at the same index.
+        vm = info["valid_mask"].reshape(-1).to(device)         # (L_pad,) bool
+        vm_blocked = vm.reshape(num_blocks, bst)               # (num_blocks, bst) bool
+
+        out = torch.zeros_like(Q_blocked)
+        chunk_size = max(1, min(self.chunk_size, num_blocks))
+        for chunk_start in range(0, num_blocks, chunk_size):
+            chunk_end = min(num_blocks, chunk_start + chunk_size)
+            c = chunk_end - chunk_start
+            q_chunk = Q_blocked[:, :, chunk_start:chunk_end]                # (B, n, c, bst, d)
+            sel = keep_index[:, :, chunk_start:chunk_end]                   # (B, n, c, num_keep) long
+
+            # Gather K and V along the num_blocks dim.
+            # K_blocked: (B, n, num_blocks, bst, d) -> we expand sel to (B, n, c, num_keep, bst, d)
+            sel_exp = sel.unsqueeze(-1).unsqueeze(-1).expand(B, n, c, num_keep, bst, d)
+            K_exp = K_blocked.unsqueeze(2).expand(B, n, c, num_blocks, bst, d)
+            V_exp = V_blocked.unsqueeze(2).expand(B, n, c, num_blocks, bst, d)
+            K_g = torch.gather(K_exp, dim=3, index=sel_exp)                 # (B, n, c, num_keep, bst, d)
+            V_g = torch.gather(V_exp, dim=3, index=sel_exp)
+            K_g = K_g.reshape(B, n, c, num_keep * bst, d)
+            V_g = V_g.reshape(B, n, c, num_keep * bst, d)
+
+            # Mask out padded key positions: gather per-block valid into per-keep mask.
+            vm_per_block = vm_blocked.unsqueeze(0).unsqueeze(0).expand(B, n, num_blocks, bst)
+            vm_exp = vm_per_block.unsqueeze(2).expand(B, n, c, num_blocks, bst)
+            vm_g = torch.gather(
+                vm_exp, dim=3, index=sel.unsqueeze(-1).expand(B, n, c, num_keep, bst)
+            )  # (B, n, c, num_keep, bst) bool
+            vm_g = vm_g.reshape(B, n, c, num_keep * bst)
+
+            # Reshape (B, n, c, *, d) -> (B*c, n, *, d) so SDPA treats each c-block independently.
+            # For correctness with B>1 we transpose batch and chunk dims before flattening.
+            Bc = B * c
+            q_flat = q_chunk.permute(0, 2, 1, 3, 4).reshape(Bc, n, bst, d)
+            k_flat = K_g.permute(0, 2, 1, 3, 4).reshape(Bc, n, num_keep * bst, d)
+            v_flat = V_g.permute(0, 2, 1, 3, 4).reshape(Bc, n, num_keep * bst, d)
+            # vm_g: (B, n, c, num_keep*bst) -> (B, c, n, num_keep*bst) -> (Bc, n, 1, num_keep*bst)
+            mask_flat = vm_g.permute(0, 2, 1, 3).reshape(Bc, n, 1, num_keep * bst).expand(Bc, n, bst, num_keep * bst)
+
+            out_chunk = F.scaled_dot_product_attention(
+                q_flat, k_flat, v_flat, attn_mask=mask_flat
+            )                                                                # (Bc, n, bst, d)
+            out[:, :, chunk_start:chunk_end] = out_chunk.reshape(B, c, n, bst, d).permute(0, 2, 1, 3, 4)
+        return out.to(dtype=dtype)
+
     def forward(
         self,
         q: torch.Tensor,

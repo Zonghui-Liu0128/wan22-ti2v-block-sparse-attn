@@ -196,3 +196,81 @@ def test_attend_block_sparse_ratio_zero_keeps_everything():
     K_block = torch.randn(1, 1, 6, 4)
     attend_block = m._compute_attend_block(Q_block, K_block)
     assert attend_block.all()
+
+
+# --- sdpa_chunked backend vs dense reference -------------------------------
+
+
+def _dense_masked_attention(
+    Q_blocked, K_blocked, V_blocked, attend_block, info
+):
+    """Reference: build the full padded (L_pad, L_pad) bool mask, run SDPA, return
+    block-shaped output."""
+    B, n, num_blocks, bst, d = Q_blocked.shape
+    L_pad = num_blocks * bst
+    Q_flat = Q_blocked.reshape(B, n, L_pad, d)
+    K_flat = K_blocked.reshape(B, n, L_pad, d)
+    V_flat = V_blocked.reshape(B, n, L_pad, d)
+    # Build per-token attend mask of shape (L_pad, L_pad)
+    block_id = torch.arange(L_pad, device=Q_flat.device) // bst   # (L_pad,)
+    # attend_block: (B, n, num_blocks, num_blocks) bool
+    # token-level: attend_token[b, n, i, j] = attend_block[b, n, block_id[i], block_id[j]]
+    attend_token = attend_block[
+        :, :, block_id.unsqueeze(1), block_id.unsqueeze(0)
+    ]  # (B, n, L_pad, L_pad)
+    # Mask out padded key positions everywhere
+    vm = info["valid_mask"].reshape(-1)  # (L_pad,) bool
+    attend_token = attend_token & vm.view(1, 1, 1, L_pad)
+    out_flat = F.scaled_dot_product_attention(
+        Q_flat, K_flat, V_flat, attn_mask=attend_token
+    )
+    return out_flat.view(B, n, num_blocks, bst, d)
+
+
+def test_sdpa_chunked_backend_matches_dense_reference_clean():
+    torch.manual_seed(6)
+    m = _make_bsa(num_heads=2, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked")
+    B, n, d = 1, 2, 4
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    q = torch.randn(B, n, L, d, dtype=torch.float32)
+    k = torch.randn(B, n, L, d, dtype=torch.float32)
+    v = torch.randn(B, n, L, d, dtype=torch.float32)
+
+    info = m._compute_block_info((f, h, w), device=q.device)
+    Q_b = m._pad_and_permute(q, (f, h, w), info)
+    K_b = m._pad_and_permute(k, (f, h, w), info)
+    V_b = m._pad_and_permute(v, (f, h, w), info)
+    Q_mean = m._block_mean(Q_b, info)
+    K_mean = m._block_mean(K_b, info)
+    attend_block = m._compute_attend_block(Q_mean, K_mean)
+
+    out_bsa = m._sparse_attn_sdpa_chunked(Q_b, K_b, V_b, attend_block, info)
+    out_ref = _dense_masked_attention(Q_b, K_b, V_b, attend_block, info)
+    assert torch.allclose(out_bsa, out_ref, atol=1e-5)
+
+
+def test_sdpa_chunked_backend_matches_dense_reference_boundary():
+    torch.manual_seed(7)
+    m = _make_bsa(num_heads=2, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked")
+    B, n, d = 1, 2, 4
+    f, h, w = 3, 4, 5
+    L = f * h * w
+    q = torch.randn(B, n, L, d, dtype=torch.float32)
+    k = torch.randn(B, n, L, d, dtype=torch.float32)
+    v = torch.randn(B, n, L, d, dtype=torch.float32)
+    info = m._compute_block_info((f, h, w), device=q.device)
+    Q_b = m._pad_and_permute(q, (f, h, w), info)
+    K_b = m._pad_and_permute(k, (f, h, w), info)
+    V_b = m._pad_and_permute(v, (f, h, w), info)
+    Q_mean = m._block_mean(Q_b, info)
+    K_mean = m._block_mean(K_b, info)
+    attend_block = m._compute_attend_block(Q_mean, K_mean)
+    out_bsa = m._sparse_attn_sdpa_chunked(Q_b, K_b, V_b, attend_block, info)
+    out_ref = _dense_masked_attention(Q_b, K_b, V_b, attend_block, info)
+    # In boundary case, padded query rows may differ (they read padded keys whose validity
+    # mask excludes them); we only require the **real-token** outputs to match.
+    # Use the inverse permute + crop to extract real-token outputs from both.
+    out_bsa_real = m._inverse_permute_and_crop(out_bsa, (f, h, w), info)
+    out_ref_real = m._inverse_permute_and_crop(out_ref, (f, h, w), info)
+    assert torch.allclose(out_bsa_real, out_ref_real, atol=1e-5)

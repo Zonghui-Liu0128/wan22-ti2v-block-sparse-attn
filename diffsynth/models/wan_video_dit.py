@@ -154,6 +154,8 @@ class BlockSparseAttention(nn.Module):
     similarity/top-K precision is unaffected), pick top-K least-similar key blocks
     per query block to *drop* (sparse_ratio == drop fraction), then attend only
     over the surviving block pairs and crop padding away.
+
+    See docs/superpowers/specs/2026-05-25-wan-bsa-design.md for the full design.
     """
 
     def __init__(

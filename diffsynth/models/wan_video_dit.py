@@ -590,13 +590,30 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        has_image_input: bool,
+        dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        eps: float = 1e-6,
+        bsa_enable: bool = False,
+        bsa_block_size: Tuple[int, int, int] = (2, 2, 2),
+        bsa_sparse_ratio: float = 0.5,
+        bsa_backend: str = "flex",
+    ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
+        self.self_attn = SelfAttention(
+            dim, num_heads, eps,
+            bsa_enable=bsa_enable,
+            bsa_block_size=bsa_block_size,
+            bsa_sparse_ratio=bsa_sparse_ratio,
+            bsa_backend=bsa_backend,
+        )
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -607,7 +624,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, video_shape: Optional[Tuple[int, int, int]] = None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -619,7 +636,7 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, video_shape=video_shape))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -748,6 +765,10 @@ class WanModel(torch.nn.Module):
         wantodance_enable_global: bool = False,
         wantodance_enable_dynamicfps: bool = False,
         wantodance_enable_unimodel: bool = False,
+        bsa_enable: bool = False,
+        bsa_block_size: Tuple[int, int, int] = (2, 2, 2),
+        bsa_sparse_ratio: float = 0.5,
+        bsa_backend: str = "flex",
     ):
         super().__init__()
         self.dim = dim
@@ -775,7 +796,13 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            DiTBlock(
+                has_image_input, dim, num_heads, ffn_dim, eps,
+                bsa_enable=bsa_enable,
+                bsa_block_size=bsa_block_size,
+                bsa_sparse_ratio=bsa_sparse_ratio,
+                bsa_backend=bsa_backend,
+            )
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -922,10 +949,11 @@ class WanModel(torch.nn.Module):
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs,
+                    video_shape=(f, h, w),
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, video_shape=(f, h, w))
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

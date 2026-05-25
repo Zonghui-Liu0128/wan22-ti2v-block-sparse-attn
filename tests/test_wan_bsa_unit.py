@@ -489,3 +489,72 @@ def test_self_attention_forward_bsa_enabled_runs():
     )
     out = sa(x, freqs, video_shape=(f, h, w))
     assert out.shape == x.shape
+
+
+# --- DiTBlock / WanModel plumbing ------------------------------------------
+
+from diffsynth.models.wan_video_dit import DiTBlock, WanModel
+
+
+def test_dit_block_default_unchanged():
+    blk = DiTBlock(has_image_input=False, dim=16, num_heads=2, ffn_dim=32)
+    assert isinstance(blk.self_attn.attn, AttentionModule)
+    assert blk.self_attn.bsa_enable is False
+
+
+def test_dit_block_bsa_propagated():
+    blk = DiTBlock(
+        has_image_input=False, dim=16, num_heads=2, ffn_dim=32,
+        bsa_enable=True, bsa_block_size=(2, 2, 2),
+        bsa_sparse_ratio=0.25, bsa_backend="sdpa_chunked",
+    )
+    assert isinstance(blk.self_attn.attn, BlockSparseAttention)
+    assert blk.self_attn.attn.sparse_ratio == 0.25
+
+
+def test_dit_block_forward_accepts_video_shape_kwarg():
+    torch.manual_seed(14)
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    dim = 16
+    blk = DiTBlock(
+        has_image_input=False, dim=dim, num_heads=2, ffn_dim=32,
+        bsa_enable=True, bsa_block_size=(2, 2, 2),
+        bsa_sparse_ratio=0.5, bsa_backend="sdpa_chunked",
+    )
+    blk.eval()
+    x = torch.randn(1, L, dim)
+    context = torch.randn(1, 4, dim)
+    t_mod = torch.zeros(1, 6, dim)
+    head_dim = dim // 2
+    freqs = torch.polar(torch.ones(L, 1, head_dim // 2), torch.zeros(L, 1, head_dim // 2))
+    out = blk(x, context, t_mod, freqs, video_shape=(f, h, w))
+    assert out.shape == x.shape
+
+
+def test_wan_model_init_accepts_bsa_kwargs_and_propagates():
+    """Smoke-test: WanModel constructs with bsa_enable=True and every block has a BSA attn."""
+    model = WanModel(
+        dim=16, in_dim=4, ffn_dim=32, out_dim=4,
+        text_dim=8, freq_dim=8, eps=1e-6,
+        patch_size=(1, 2, 2),
+        num_heads=2, num_layers=2,
+        has_image_input=False,
+        bsa_enable=True, bsa_block_size=(2, 2, 2),
+        bsa_sparse_ratio=0.5, bsa_backend="sdpa_chunked",
+    )
+    for b in model.blocks:
+        assert isinstance(b.self_attn.attn, BlockSparseAttention)
+
+
+def test_wan_model_init_default_unchanged():
+    """Without bsa_* kwargs, blocks must keep the standard AttentionModule."""
+    model = WanModel(
+        dim=16, in_dim=4, ffn_dim=32, out_dim=4,
+        text_dim=8, freq_dim=8, eps=1e-6,
+        patch_size=(1, 2, 2),
+        num_heads=2, num_layers=2,
+        has_image_input=False,
+    )
+    for b in model.blocks:
+        assert isinstance(b.self_attn.attn, AttentionModule)

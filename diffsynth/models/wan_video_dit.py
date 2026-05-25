@@ -222,6 +222,54 @@ class BlockSparseAttention(nn.Module):
             "valid_mask": valid_mask,
         }
 
+    def _pad_and_permute(
+        self,
+        x: torch.Tensor,
+        video_shape: Tuple[int, int, int],
+        info: dict,
+    ) -> torch.Tensor:
+        """(B, n, L=f*h*w, d) -> (B, n, num_blocks, block_size_total, d) with zero pad."""
+        from einops import rearrange  # local to avoid polluting module-level if it ever moves
+        f, h, w = video_shape
+        bt, bh, bw = self.block_size
+        F_pad, H_pad, W_pad = info["pad_shape"]
+        nT, nH, nW = info["new_grid"]
+        B, n, L, d = x.shape
+        assert L == f * h * w, f"x.shape[2]={L} != f*h*w={f*h*w}"
+        x = x.view(B, n, f, h, w, d)
+        if (F_pad, H_pad, W_pad) != (f, h, w):
+            # F.pad expects pad spec from last dim backward: (d, w, h, f) ordering.
+            # We don't pad d; we pad w by (0, W_pad-w), h by (0, H_pad-h), f by (0, F_pad-f).
+            x = F.pad(x, (0, 0, 0, W_pad - w, 0, H_pad - h, 0, F_pad - f))
+        # block-contiguous rearrangement
+        x = rearrange(
+            x,
+            "b n (tT bt) (hH bh) (wW bw) d -> b n (tT hH wW) (bt bh bw) d",
+            tT=nT, hH=nH, wW=nW, bt=bt, bh=bh, bw=bw,
+        )
+        return x
+
+    def _inverse_permute_and_crop(
+        self,
+        blocked: torch.Tensor,
+        video_shape: Tuple[int, int, int],
+        info: dict,
+    ) -> torch.Tensor:
+        """(B, n, num_blocks, block_size_total, d) -> (B, n, L, d), cropping padding."""
+        from einops import rearrange
+        f, h, w = video_shape
+        bt, bh, bw = self.block_size
+        F_pad, H_pad, W_pad = info["pad_shape"]
+        nT, nH, nW = info["new_grid"]
+        x = rearrange(
+            blocked,
+            "b n (tT hH wW) (bt bh bw) d -> b n (tT bt) (hH bh) (wW bw) d",
+            tT=nT, hH=nH, wW=nW, bt=bt, bh=bh, bw=bw,
+        )
+        x = x[:, :, :f, :h, :w, :].contiguous()
+        B, n, _, _, _, d = x.shape
+        return x.view(B, n, f * h * w, d)
+
     def forward(
         self,
         q: torch.Tensor,

@@ -58,3 +58,53 @@ def test_block_info_boundary_case_3_4_5_with_block_2_2_2():
     expected_vm = torch.zeros(4, 4, 6, dtype=torch.bool)
     expected_vm[:3, :4, :5] = True
     assert torch.equal(vm, expected_vm)
+
+
+# --- pad/permute round-trip -------------------------------------------------
+
+
+def test_pad_permute_round_trip_clean():
+    torch.manual_seed(0)
+    m = _make_bsa(num_heads=2, block=(2, 2, 2))
+    B, n, d = 1, 2, 4
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    x = torch.randn(B, n, L, d)
+    info = m._compute_block_info((f, h, w), device=x.device)
+    blocked = m._pad_and_permute(x, (f, h, w), info)
+    assert blocked.shape == (B, n, info["num_blocks"], info["block_size_total"], d)
+    restored = m._inverse_permute_and_crop(blocked, (f, h, w), info)
+    assert restored.shape == x.shape
+    assert torch.equal(restored, x)
+
+
+def test_pad_permute_round_trip_boundary():
+    torch.manual_seed(1)
+    m = _make_bsa(num_heads=2, block=(2, 2, 2))
+    B, n, d = 1, 2, 4
+    f, h, w = 3, 4, 5
+    L = f * h * w
+    x = torch.randn(B, n, L, d)
+    info = m._compute_block_info((f, h, w), device=x.device)
+    blocked = m._pad_and_permute(x, (f, h, w), info)
+    assert blocked.shape == (B, n, info["num_blocks"], info["block_size_total"], d)
+    restored = m._inverse_permute_and_crop(blocked, (f, h, w), info)
+    assert restored.shape == x.shape
+    assert torch.equal(restored, x)
+    # Verify padded slots are zero in the blocked tensor
+    vm = info["valid_mask"].reshape(-1)
+    # Reshape blocked back to padded flat order (B, n, F_pad*H_pad*W_pad, d) via the inverse rearrange
+    F_pad, H_pad, W_pad = info["pad_shape"]
+    bt, bh, bw = m.block_size
+    nT, nH, nW = info["new_grid"]
+    from einops import rearrange as _rearr
+    flat_padded = _rearr(
+        blocked,
+        "b n (tT hH wW) (bt bh bw) d -> b n (tT bt hH bh wW bw) d",
+        tT=nT, hH=nH, wW=nW, bt=bt, bh=bh, bw=bw,
+    )
+    # Padded positions must be exactly zero
+    assert torch.equal(
+        flat_padded[:, :, ~vm, :],
+        torch.zeros_like(flat_padded[:, :, ~vm, :]),
+    )

@@ -270,6 +270,21 @@ class BlockSparseAttention(nn.Module):
         B, n, _, _, _, d = x.shape
         return x.view(B, n, f * h * w, d)
 
+    def _block_mean(
+        self,
+        blocked: torch.Tensor,
+        info: dict,
+    ) -> torch.Tensor:
+        """Weighted block-mean: sum over block_size_total dim divided by real-token count.
+
+        Equivalent to mean over real tokens only (padded zeros do not contribute to sum).
+        Shape: (B, n, num_blocks, block_size_total, d) -> (B, n, num_blocks, d).
+        """
+        count = info["count"]  # (num_blocks,) long
+        # cast count to match the data dtype to avoid integer divide
+        count_f = count.to(dtype=blocked.dtype).view(1, 1, -1, 1)
+        return blocked.sum(dim=-2) / count_f
+
     def forward(
         self,
         q: torch.Tensor,

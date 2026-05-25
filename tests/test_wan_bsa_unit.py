@@ -108,3 +108,54 @@ def test_pad_permute_round_trip_boundary():
         flat_padded[:, :, ~vm, :],
         torch.zeros_like(flat_padded[:, :, ~vm, :]),
     )
+
+
+# --- weighted block mean ----------------------------------------------------
+
+
+def test_block_mean_clean_matches_template_mean():
+    """For non-boundary case the weighted mean must equal a plain mean(dim=-2)."""
+    torch.manual_seed(2)
+    m = _make_bsa(num_heads=2, block=(2, 2, 2))
+    B, n, d = 1, 2, 4
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    x = torch.randn(B, n, L, d)
+    info = m._compute_block_info((f, h, w), device=x.device)
+    blocked = m._pad_and_permute(x, (f, h, w), info)
+    mean_weighted = m._block_mean(blocked, info)
+    mean_plain = blocked.mean(dim=-2)
+    assert torch.allclose(mean_weighted, mean_plain, atol=1e-6)
+
+
+def test_block_mean_boundary_is_unbiased_real_token_mean():
+    """For boundary blocks the weighted mean must equal mean over real tokens only,
+    i.e. ignore zero-padded slots in the block."""
+    torch.manual_seed(3)
+    m = _make_bsa(num_heads=1, block=(2, 2, 2))
+    B, n, d = 1, 1, 3
+    f, h, w = 3, 4, 5
+    L = f * h * w
+    x = torch.randn(B, n, L, d)
+    info = m._compute_block_info((f, h, w), device=x.device)
+    blocked = m._pad_and_permute(x, (f, h, w), info)
+    mean_weighted = m._block_mean(blocked, info)  # (B, n, num_blocks, d)
+
+    # Compute reference per-block mean by manually iterating real tokens.
+    bt, bh, bw = m.block_size
+    nT, nH, nW = info["new_grid"]
+    # x as (B, n, f, h, w, d)
+    x_vol = x.view(B, n, f, h, w, d)
+    expected = torch.zeros(B, n, info["num_blocks"], d)
+    block_idx = 0
+    for t_out in range(nT):
+        for h_out in range(nH):
+            for w_out in range(nW):
+                t_lo, t_hi = t_out * bt, min(f, (t_out + 1) * bt)
+                h_lo, h_hi = h_out * bh, min(h, (h_out + 1) * bh)
+                w_lo, w_hi = w_out * bw, min(w, (w_out + 1) * bw)
+                sub = x_vol[:, :, t_lo:t_hi, h_lo:h_hi, w_lo:w_hi, :]
+                cnt = sub.shape[2] * sub.shape[3] * sub.shape[4]
+                expected[:, :, block_idx, :] = sub.reshape(B, n, cnt, d).mean(dim=2)
+                block_idx += 1
+    assert torch.allclose(mean_weighted, expected, atol=1e-5)

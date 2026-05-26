@@ -29,11 +29,13 @@ except ModuleNotFoundError:
 try:
     from torch.nn.attention.flex_attention import flex_attention as _flex_attention
     from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
+    from torch.nn.attention.flex_attention import BlockMask as _FlexBlockMask
     FLEX_ATTN_AVAILABLE = True
 except ImportError:
     FLEX_ATTN_AVAILABLE = False
     _flex_attention = None
     _create_block_mask = None
+    _FlexBlockMask = None
 
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
@@ -401,7 +403,19 @@ class BlockSparseAttention(nn.Module):
         attend_block: torch.Tensor,
         info: dict,
     ) -> torch.Tensor:
-        """FlexAttention sparse path. Returns (B, n, num_blocks, block_size_total, d)."""
+        """FlexAttention sparse path. Returns (B, n, num_blocks, block_size_total, d).
+
+        We construct the BlockMask DIRECTLY from ``attend_block`` via
+        ``BlockMask.from_kv_blocks``, instead of going through ``create_block_mask``
+        with a token-level ``mask_mod`` that indexes ``attend_block``. The latter
+        triggers a vmap over (B, H, Q_LEN, KV_LEN) -> aten.index over the 4-D
+        ``attend_block`` -> O(B*H*Q_LEN*KV_LEN) intermediate, OOM at prod scale.
+        ``from_kv_blocks`` skips the eager mask materialisation entirely.
+
+        Padded keys (boundary blocks contain padding in the block-contiguous
+        layout) are gated by a tiny token-level ``mask_mod`` that just looks
+        ``vm_perm[kv_idx]`` -- a 1-D index, safe under vmap.
+        """
         if not FLEX_ATTN_AVAILABLE:
             raise RuntimeError(
                 "FlexAttention not available — install PyTorch >= 2.5 or switch backend='sdpa_chunked'."
@@ -415,35 +429,38 @@ class BlockSparseAttention(nn.Module):
         K_perm = K_blocked.reshape(B, n, L_pad, d).contiguous()
         V_perm = V_blocked.reshape(B, n, L_pad, d).contiguous()
 
-        # Valid token mask in block-contiguous (permuted) order.
+        # Build full-width (B, n, num_blocks, num_blocks) kv_indices directly
+        # from attend_block. PyTorch's BlockMask.from_kv_blocks currently treats
+        # kv_indices.shape[-1] as the total KV block count when transposing the
+        # mask; using a compact num_keep width breaks for high sparsity when
+        # kept block ids are larger than num_keep. kv_num_blocks tells Flex how
+        # many sorted entries are valid in each row.
+        _, sort_idx = attend_block.to(torch.int8).sort(dim=-1, descending=True, stable=True)
+        kv_indices = sort_idx.to(torch.int32).contiguous()
+        kv_num_blocks = attend_block.sum(dim=-1).to(torch.int32).contiguous()
+
+        # Token-level padded-key mask: a 1-D lookup -- safe under vmap.
+        from einops import rearrange
         F_pad, H_pad, W_pad = info["pad_shape"]
         bt, bh, bw = self.block_size
         nT, nH, nW = info["new_grid"]
-        from einops import rearrange
-        vm = info["valid_mask"].to(device)
         vm_perm = rearrange(
-            vm,
+            info["valid_mask"].to(device),
             "(tT bt) (hH bh) (wW bw) -> (tT hH wW bt bh bw)",
             tT=nT, hH=nH, wW=nW, bt=bt, bh=bh, bw=bw,
-        ).contiguous()                                       # (L_pad,) bool
-
-        # FlexAttention kernel BLOCK_SIZE must be a multiple of 16 (typical kernel constraint).
-        # We pick the smallest multiple of 16 that is >= block_size_total.
-        kernel_block_size = max(16, ((bst + 15) // 16) * 16)
+        ).contiguous()  # (L_pad,) bool
 
         def mask_mod(b_idx, h_idx, q_idx, kv_idx):
-            q_block = q_idx // bst
-            kv_block = kv_idx // bst
-            return attend_block[b_idx, h_idx, q_block, kv_block] & vm_perm[kv_idx]
+            return vm_perm[kv_idx]
 
-        block_mask = _create_block_mask(
-            mask_mod,
-            B=B,
-            H=n,
-            Q_LEN=L_pad,
-            KV_LEN=L_pad,
-            device=device,
-            BLOCK_SIZE=kernel_block_size,
+        # Use the BSA token-block size (bt*bh*bw) so each Flex block maps exactly
+        # to one 3D sparse block and no token-level attend_block lookup is needed.
+        block_mask = _FlexBlockMask.from_kv_blocks(
+            kv_num_blocks=kv_num_blocks,
+            kv_indices=kv_indices,
+            BLOCK_SIZE=bst,
+            mask_mod=mask_mod,
+            seq_lengths=(L_pad, L_pad),
         )
         out_perm = _flex_attention(Q_perm, K_perm, V_perm, block_mask=block_mask)
         return out_perm.view(B, n, num_blocks, bst, d)

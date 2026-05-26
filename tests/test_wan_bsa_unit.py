@@ -352,6 +352,58 @@ def test_flex_backend_matches_sdpa_chunked_boundary():
     assert torch.allclose(out_sdpa_real, out_flex_real, atol=2e-4, rtol=1e-4)
 
 
+def test_flex_backend_builds_block_mask_without_create_block_mask(monkeypatch):
+    """The flex path already has block-level sparsity in attend_block.
+
+    Rebuilding it through token-level create_block_mask calls mask_mod under vmap
+    and can materialize huge dynamic-index tensors. The flex path should convert
+    attend_block directly to a BlockMask.
+    """
+    from torch.nn.attention.flex_attention import BlockMask
+    import diffsynth.models.wan_video_dit as wan_dit
+
+    torch.manual_seed(21)
+    f, h, w = 21, 16, 15
+    block = (3, 2, 3)
+    sparse_ratio = 0.8
+    device = torch.device("cpu")
+    B, n, d = 1, 2, 4
+    q = torch.randn(B, n, f * h * w, d, dtype=torch.float32, device=device)
+    k = torch.randn(B, n, f * h * w, d, dtype=torch.float32, device=device)
+    v = torch.randn(B, n, f * h * w, d, dtype=torch.float32, device=device)
+    m = _make_bsa(num_heads=n, block=block, sparse_ratio=sparse_ratio, backend="flex")
+
+    info = m._compute_block_info((f, h, w), device=device)
+    Q_b = m._pad_and_permute(q, (f, h, w), info)
+    K_b = m._pad_and_permute(k, (f, h, w), info)
+    V_b = m._pad_and_permute(v, (f, h, w), info)
+    Q_mean = m._block_mean(Q_b, info)
+    K_mean = m._block_mean(K_b, info)
+    attend_block = m._compute_attend_block(Q_mean, K_mean)
+
+    assert info["num_blocks"] == 280
+    assert info["block_size_total"] == 18
+    assert ((~attend_block).sum(dim=-1) == int(280 * sparse_ratio)).all()
+
+    def fail_create_block_mask(*args, **kwargs):
+        raise AssertionError("flex BSA must not call create_block_mask")
+
+    def fake_flex_attention(Q, K, V, *, block_mask):
+        assert isinstance(block_mask, BlockMask)
+        assert block_mask.seq_lengths == (Q.shape[-2], K.shape[-2])
+        assert block_mask.BLOCK_SIZE == (18, 18)
+        assert block_mask.kv_num_blocks.shape == (B, n, 280)
+        assert block_mask.kv_indices.shape == (B, n, 280, 280)
+        assert torch.equal(block_mask.kv_num_blocks, torch.full((B, n, 280), 56, dtype=torch.int32))
+        return torch.zeros_like(Q)
+
+    monkeypatch.setattr(wan_dit, "_create_block_mask", fail_create_block_mask)
+    monkeypatch.setattr(wan_dit, "_flex_attention", fake_flex_attention)
+
+    out = m._sparse_attn_flex(Q_b, K_b, V_b, attend_block, info)
+    assert out.shape == Q_b.shape
+
+
 # --- end-to-end BlockSparseAttention.forward -------------------------------
 
 

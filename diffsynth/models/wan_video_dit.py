@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
 from typing import Tuple, Optional
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
@@ -355,7 +356,10 @@ class BlockSparseAttention(nn.Module):
         )                                                       # (num_blocks, bst) bool
 
         out = torch.zeros_like(Q_blocked)
-        chunk_size = max(1, min(self.chunk_size, num_blocks))
+        chunk_size = self._effective_sdpa_chunk_size(
+            B=B, n=n, num_blocks=num_blocks, num_keep=num_keep,
+            bst=bst, d=d, dtype=dtype, device=device,
+        )
         for chunk_start in range(0, num_blocks, chunk_size):
             chunk_end = min(num_blocks, chunk_start + chunk_size)
             c = chunk_end - chunk_start
@@ -394,6 +398,66 @@ class BlockSparseAttention(nn.Module):
             )                                                                # (Bc, n, bst, d)
             out[:, :, chunk_start:chunk_end] = out_chunk.reshape(B, c, n, bst, d).permute(0, 2, 1, 3, 4)
         return out.to(dtype=dtype)
+
+    def _effective_sdpa_chunk_size(
+        self,
+        B: int,
+        n: int,
+        num_blocks: int,
+        num_keep: int,
+        bst: int,
+        d: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> int:
+        requested = max(1, min(int(self.chunk_size), num_blocks))
+        per_block_bytes = self._estimate_sdpa_temp_bytes_per_query_block(
+            B=B, n=n, num_keep=num_keep, bst=bst, d=d, dtype=dtype,
+        )
+        if per_block_bytes <= 0:
+            return requested
+        budget = self._sdpa_chunk_memory_budget(device)
+        return max(1, min(requested, budget // per_block_bytes))
+
+    @staticmethod
+    def _estimate_sdpa_temp_bytes_per_query_block(
+        B: int,
+        n: int,
+        num_keep: int,
+        bst: int,
+        d: int,
+        dtype: torch.dtype,
+    ) -> int:
+        elem_size = torch.empty((), dtype=dtype).element_size()
+        score_elem_size = max(elem_size, 4)
+        kv_tokens = num_keep * bst
+        gathered_kv = 2 * B * n * kv_tokens * d * elem_size
+        query_and_output = 2 * B * n * bst * d * elem_size
+        mask = B * n * bst * kv_tokens
+        score_work = 3 * B * n * bst * kv_tokens * score_elem_size
+        return gathered_kv + query_and_output + mask + score_work
+
+    @staticmethod
+    def _sdpa_chunk_memory_budget(device: torch.device) -> int:
+        env_budget = os.environ.get("DIFFSYNTH_BSA_SDPA_CHUNK_BYTES")
+        if env_budget:
+            try:
+                budget = int(env_budget)
+                if budget > 0:
+                    return budget
+            except ValueError:
+                pass
+
+        default_budget = 128 * 1024 * 1024
+        min_budget = 16 * 1024 * 1024
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                index = device.index if device.index is not None else torch.cuda.current_device()
+                free_bytes, _ = torch.cuda.mem_get_info(index)
+                return max(min_budget, min(default_budget, int(free_bytes * 0.02)))
+            except RuntimeError:
+                return default_budget
+        return default_budget
 
     def _sparse_attn_flex(
         self,

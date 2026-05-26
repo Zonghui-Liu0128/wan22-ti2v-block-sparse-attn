@@ -287,6 +287,50 @@ def test_sdpa_chunked_backend_matches_dense_reference_boundary():
     assert torch.allclose(out_bsa_real, out_ref_real, atol=1e-5)
 
 
+def test_sdpa_chunked_backend_caps_chunk_size_for_real_patch_grid(monkeypatch):
+    """The SDPA fallback must shrink query-block chunks under a tight memory cap.
+
+    This uses the H100 repro geometry: patchified (21,16,15), block=(3,2,3),
+    sparse_ratio=0.8 -> 280 BSA blocks and 56 kept blocks per row.
+    """
+    import diffsynth.models.wan_video_dit as wan_dit
+
+    monkeypatch.setenv("DIFFSYNTH_BSA_SDPA_CHUNK_BYTES", str(1024 * 1024))
+    torch.manual_seed(22)
+    f, h, w = 21, 16, 15
+    block = (3, 2, 3)
+    sparse_ratio = 0.8
+    B, n, d = 1, 2, 4
+    q = torch.randn(B, n, f * h * w, d, dtype=torch.float32)
+    k = torch.randn(B, n, f * h * w, d, dtype=torch.float32)
+    v = torch.randn(B, n, f * h * w, d, dtype=torch.float32)
+    m = _make_bsa(num_heads=n, block=block, sparse_ratio=sparse_ratio, backend="sdpa_chunked")
+    m.chunk_size = 64
+
+    info = m._compute_block_info((f, h, w), device=q.device)
+    Q_b = m._pad_and_permute(q, (f, h, w), info)
+    K_b = m._pad_and_permute(k, (f, h, w), info)
+    V_b = m._pad_and_permute(v, (f, h, w), info)
+    Q_mean = m._block_mean(Q_b, info)
+    K_mean = m._block_mean(K_b, info)
+    attend_block = m._compute_attend_block(Q_mean, K_mean)
+
+    call_batch_sizes = []
+
+    def fake_sdpa(q_flat, k_flat, v_flat, attn_mask=None):
+        call_batch_sizes.append(q_flat.shape[0])
+        assert q_flat.shape[0] == 1
+        assert k_flat.shape[-2] == 56 * 18
+        return torch.zeros_like(q_flat)
+
+    monkeypatch.setattr(wan_dit.F, "scaled_dot_product_attention", fake_sdpa)
+    out = m._sparse_attn_sdpa_chunked(Q_b, K_b, V_b, attend_block, info)
+
+    assert out.shape == Q_b.shape
+    assert max(call_batch_sizes) == 1
+    assert len(call_batch_sizes) == 280
+
+
 # --- flex backend cross-check (CUDA + flex_attention only) ------------------
 
 from diffsynth.models.wan_video_dit import FLEX_ATTN_AVAILABLE

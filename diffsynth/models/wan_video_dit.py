@@ -29,14 +29,37 @@ except ModuleNotFoundError:
 
 try:
     from torch.nn.attention.flex_attention import flex_attention as _flex_attention
-    from torch.nn.attention.flex_attention import create_block_mask as _create_block_mask
     from torch.nn.attention.flex_attention import BlockMask as _FlexBlockMask
     FLEX_ATTN_AVAILABLE = True
 except ImportError:
     FLEX_ATTN_AVAILABLE = False
     _flex_attention = None
-    _create_block_mask = None
     _FlexBlockMask = None
+
+_COMPILED_FLEX_ATTENTION = None
+
+
+def _compiled_flex_attention(q, k, v, block_mask):
+    """Compiled FlexAttention is required for BlockMask sparsity on CUDA."""
+    return _flex_attention(
+        q, k, v,
+        block_mask=block_mask,
+        kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
+    )
+
+
+def _get_compiled_flex_attention():
+    global _COMPILED_FLEX_ATTENTION
+    if _COMPILED_FLEX_ATTENTION is None:
+        import torch._inductor.config as inductor_config
+
+        # PyTorch 2.8's default FlexAttention config uses 128x64 tiles, which
+        # cannot run BSA blocks of 32 tokens. Exhaustive search includes the
+        # 32x32/16x32 kernels needed by Wan BSA's default block=(2,4,4).
+        inductor_config.max_autotune = True
+        inductor_config.max_autotune_flex_search_space = "EXHAUSTIVE"
+        _COMPILED_FLEX_ATTENTION = torch.compile(_compiled_flex_attention, dynamic=False)
+    return _COMPILED_FLEX_ATTENTION
 
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
@@ -151,14 +174,10 @@ class AttentionModule(nn.Module):
 class BlockSparseAttention(nn.Module):
     """Block Sparse Attention used by SelfAttention when bsa_enable=True.
 
-    Algorithm mirrors template_BSA.py: pad the (f,h,w) volume to block-aligned size,
-    rearrange so tokens within the same spatial block are contiguous, compute a
-    weighted block-mean of Q/K (boundary blocks normalised by real-token count so
-    similarity/top-K precision is unaffected), pick top-K least-similar key blocks
-    per query block to *drop* (sparse_ratio == drop fraction), then attend only
-    over the surviving block pairs and crop padding away.
-
-    See docs/superpowers/specs/2026-05-25-wan-bsa-design.md for the full design.
+    The module pads the (f,h,w) latent grid to the requested 3D block size,
+    computes Q/K block means using real-token counts for boundary blocks, drops
+    floor(num_blocks * sparse_ratio) least-similar key blocks per query block,
+    attends over the remaining block pairs, and crops padding from the output.
     """
 
     def __init__(
@@ -177,16 +196,10 @@ class BlockSparseAttention(nn.Module):
         self.sparse_ratio = float(sparse_ratio)
         self.backend = backend
         self.chunk_size = chunk_size
-
-        # Debug hook — flip to True from outside to capture intermediates.
-        self._debug_record: bool = False
-        self._dbg_attend_block = None    # (B, n, num_blocks, num_blocks) bool
-        self._dbg_top_index = None       # (B, n, num_blocks, K_drop) long
-        self._dbg_count = None           # (num_blocks,) long
-        self._dbg_valid_mask = None      # (F_pad, H_pad, W_pad) bool
-        self._dbg_pad_shape = None       # (F_pad, H_pad, W_pad)
-        self._dbg_video_shape = None     # (f, h, w)
-        self._dbg_block_size = None      # (bt, bh, bw)
+        self.record_attend_block = False
+        self.last_attend_block = None
+        self.last_video_shape = None
+        self.last_block_size = None
 
     def _compute_block_info(
         self, video_shape: Tuple[int, int, int], device: torch.device
@@ -234,7 +247,6 @@ class BlockSparseAttention(nn.Module):
         info: dict,
     ) -> torch.Tensor:
         """(B, n, L=f*h*w, d) -> (B, n, num_blocks, block_size_total, d) with zero pad."""
-        from einops import rearrange  # local to avoid polluting module-level if it ever moves
         f, h, w = video_shape
         bt, bh, bw = self.block_size
         F_pad, H_pad, W_pad = info["pad_shape"]
@@ -261,7 +273,6 @@ class BlockSparseAttention(nn.Module):
         info: dict,
     ) -> torch.Tensor:
         """(B, n, num_blocks, block_size_total, d) -> (B, n, L, d), cropping padding."""
-        from einops import rearrange
         f, h, w = video_shape
         bt, bh, bw = self.block_size
         F_pad, H_pad, W_pad = info["pad_shape"]
@@ -306,9 +317,6 @@ class BlockSparseAttention(nn.Module):
         if K_drop > 0:
             top_index = (-sim).topk(K_drop, dim=-1).indices    # (B, n, num_blocks, K_drop) long
             attend.scatter_(-1, top_index, False)
-            self._last_top_index = top_index  # used for sdpa_chunked backend later
-        else:
-            self._last_top_index = None
         return attend
 
     def _sparse_attn_sdpa_chunked(
@@ -344,7 +352,6 @@ class BlockSparseAttention(nn.Module):
         # block-contiguous (num_blocks, block_size_total); apply the same rearrange to
         # the bool validity mask so vm_blocked[block_idx, intra_idx] corresponds to the
         # SAME spatial position as K_blocked[..., block_idx, intra_idx, :].
-        from einops import rearrange
         F_pad, H_pad, W_pad = info["pad_shape"]
         bt, bh, bw = self.block_size
         nT, nH, nW = info["new_grid"]
@@ -487,6 +494,19 @@ class BlockSparseAttention(nn.Module):
         B, n, num_blocks, bst, d = Q_blocked.shape
         L_pad = num_blocks * bst
         device = Q_blocked.device
+        if device.type == "cuda":
+            if bst < 32 or bst % 32 != 0:
+                raise RuntimeError(
+                    "FlexAttention backend requires bt*bh*bw to be a multiple of 32 "
+                    f"on CUDA with PyTorch 2.8, got block_size={self.block_size} "
+                    f"(bt*bh*bw={bst}). Use block_size=(2,4,4) or switch "
+                    "backend='sdpa_chunked'."
+                )
+            if d < 16:
+                raise RuntimeError(
+                    "FlexAttention backend requires per-head dimension >= 16 on CUDA; "
+                    f"got d={d}. Use backend='sdpa_chunked' for tiny test tensors."
+                )
 
         # Permuted padded sequence view: (B, n, L_pad, d)
         Q_perm = Q_blocked.reshape(B, n, L_pad, d).contiguous()
@@ -504,7 +524,6 @@ class BlockSparseAttention(nn.Module):
         kv_num_blocks = attend_block.sum(dim=-1).to(torch.int32).contiguous()
 
         # Token-level padded-key mask: a 1-D lookup -- safe under vmap.
-        from einops import rearrange
         F_pad, H_pad, W_pad = info["pad_shape"]
         bt, bh, bw = self.block_size
         nT, nH, nW = info["new_grid"]
@@ -526,7 +545,10 @@ class BlockSparseAttention(nn.Module):
             mask_mod=mask_mod,
             seq_lengths=(L_pad, L_pad),
         )
-        out_perm = _flex_attention(Q_perm, K_perm, V_perm, block_mask=block_mask)
+        if device.type == "cuda":
+            out_perm = _get_compiled_flex_attention()(Q_perm, K_perm, V_perm, block_mask)
+        else:
+            out_perm = _flex_attention(Q_perm, K_perm, V_perm, block_mask=block_mask)
         return out_perm.view(B, n, num_blocks, bst, d)
 
     def forward(
@@ -536,7 +558,6 @@ class BlockSparseAttention(nn.Module):
         v: torch.Tensor,
         video_shape: Tuple[int, int, int],
     ) -> torch.Tensor:
-        from einops import rearrange
         B, L, nd = q.shape
         n = self.num_heads
         d = nd // n
@@ -555,6 +576,10 @@ class BlockSparseAttention(nn.Module):
         Q_mean = self._block_mean(Q_b, info)
         K_mean = self._block_mean(K_b, info)
         attend_block = self._compute_attend_block(Q_mean, K_mean)
+        if self.record_attend_block:
+            self.last_attend_block = attend_block[:1, :1].detach().cpu()
+            self.last_video_shape = tuple(video_shape)
+            self.last_block_size = tuple(self.block_size)
 
         if self.backend == "flex":
             out_b = self._sparse_attn_flex(Q_b, K_b, V_b, attend_block, info)
@@ -564,18 +589,7 @@ class BlockSparseAttention(nn.Module):
             raise ValueError(f"Unknown backend: {self.backend}")
 
         out_nd = self._inverse_permute_and_crop(out_b, video_shape, info)
-        out = rearrange(out_nd, "b n l d -> b l (n d)").contiguous()
-
-        if self._debug_record:
-            self._dbg_attend_block = attend_block.detach()
-            self._dbg_top_index = getattr(self, "_last_top_index", None)
-            self._dbg_count = info["count"].detach()
-            self._dbg_valid_mask = info["valid_mask"].detach()
-            self._dbg_pad_shape = info["pad_shape"]
-            self._dbg_video_shape = tuple(video_shape)
-            self._dbg_block_size = tuple(self.block_size)
-
-        return out
+        return rearrange(out_nd, "b n l d -> b l (n d)").contiguous()
 
 
 class SelfAttention(nn.Module):
@@ -585,7 +599,7 @@ class SelfAttention(nn.Module):
         num_heads: int,
         eps: float = 1e-6,
         bsa_enable: bool = False,
-        bsa_block_size: Tuple[int, int, int] = (2, 2, 2),
+        bsa_block_size: Tuple[int, int, int] = (2, 4, 4),
         bsa_sparse_ratio: float = 0.5,
         bsa_backend: str = "flex",
     ):
@@ -681,7 +695,7 @@ class DiTBlock(nn.Module):
         ffn_dim: int,
         eps: float = 1e-6,
         bsa_enable: bool = False,
-        bsa_block_size: Tuple[int, int, int] = (2, 2, 2),
+        bsa_block_size: Tuple[int, int, int] = (2, 4, 4),
         bsa_sparse_ratio: float = 0.5,
         bsa_backend: str = "flex",
     ):
@@ -849,7 +863,7 @@ class WanModel(torch.nn.Module):
         wantodance_enable_dynamicfps: bool = False,
         wantodance_enable_unimodel: bool = False,
         bsa_enable: bool = False,
-        bsa_block_size: Tuple[int, int, int] = (2, 2, 2),
+        bsa_block_size: Tuple[int, int, int] = (2, 4, 4),
         bsa_sparse_ratio: float = 0.5,
         bsa_backend: str = "flex",
     ):

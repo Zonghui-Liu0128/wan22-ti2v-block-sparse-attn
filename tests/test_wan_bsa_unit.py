@@ -1,4 +1,3 @@
-import math
 import pytest
 import torch
 import torch.nn.functional as F
@@ -346,15 +345,16 @@ _flex_skip = pytest.mark.skipif(
 @_flex_skip
 def test_flex_backend_matches_sdpa_chunked_clean():
     torch.manual_seed(8)
-    f, h, w = 4, 4, 4
+    f, h, w = 4, 8, 8
+    block = (2, 4, 4)
     L = f * h * w
     device = torch.device("cuda")
-    B, n, d = 1, 2, 4
+    B, n, d = 1, 2, 16
     q = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
     k = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
     v = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
-    m_sdpa = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked").to(device)
-    m_flex = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="flex").to(device)
+    m_sdpa = _make_bsa(num_heads=n, block=block, sparse_ratio=0.5, backend="sdpa_chunked").to(device)
+    m_flex = _make_bsa(num_heads=n, block=block, sparse_ratio=0.5, backend="flex").to(device)
 
     info = m_sdpa._compute_block_info((f, h, w), device=device)
     Q_b = m_sdpa._pad_and_permute(q, (f, h, w), info)
@@ -372,15 +372,16 @@ def test_flex_backend_matches_sdpa_chunked_clean():
 @_flex_skip
 def test_flex_backend_matches_sdpa_chunked_boundary():
     torch.manual_seed(9)
-    f, h, w = 3, 4, 5
+    f, h, w = 3, 5, 7
+    block = (2, 4, 4)
     L = f * h * w
     device = torch.device("cuda")
-    B, n, d = 1, 2, 4
+    B, n, d = 1, 2, 16
     q = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
     k = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
     v = torch.randn(B, n, L, d, dtype=torch.float32, device=device)
-    m_sdpa = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked").to(device)
-    m_flex = _make_bsa(num_heads=n, block=(2, 2, 2), sparse_ratio=0.5, backend="flex").to(device)
+    m_sdpa = _make_bsa(num_heads=n, block=block, sparse_ratio=0.5, backend="sdpa_chunked").to(device)
+    m_flex = _make_bsa(num_heads=n, block=block, sparse_ratio=0.5, backend="flex").to(device)
     info = m_sdpa._compute_block_info((f, h, w), device=device)
     Q_b = m_sdpa._pad_and_permute(q, (f, h, w), info)
     K_b = m_sdpa._pad_and_permute(k, (f, h, w), info)
@@ -429,9 +430,6 @@ def test_flex_backend_builds_block_mask_without_create_block_mask(monkeypatch):
     assert info["block_size_total"] == 18
     assert ((~attend_block).sum(dim=-1) == int(280 * sparse_ratio)).all()
 
-    def fail_create_block_mask(*args, **kwargs):
-        raise AssertionError("flex BSA must not call create_block_mask")
-
     def fake_flex_attention(Q, K, V, *, block_mask):
         assert isinstance(block_mask, BlockMask)
         assert block_mask.seq_lengths == (Q.shape[-2], K.shape[-2])
@@ -441,7 +439,6 @@ def test_flex_backend_builds_block_mask_without_create_block_mask(monkeypatch):
         assert torch.equal(block_mask.kv_num_blocks, torch.full((B, n, 280), 56, dtype=torch.int32))
         return torch.zeros_like(Q)
 
-    monkeypatch.setattr(wan_dit, "_create_block_mask", fail_create_block_mask)
     monkeypatch.setattr(wan_dit, "_flex_attention", fake_flex_attention)
 
     out = m._sparse_attn_flex(Q_b, K_b, V_b, attend_block, info)
@@ -462,13 +459,8 @@ def test_forward_end_to_end_clean_sdpa_chunked():
     k = torch.randn(B, L, num_heads * d, dtype=torch.float32)
     v = torch.randn(B, L, num_heads * d, dtype=torch.float32)
     m = _make_bsa(num_heads=num_heads, block=block, sparse_ratio=0.5, backend="sdpa_chunked")
-    m._debug_record = True
     out = m(q, k, v, (f, h, w))
     assert out.shape == (B, L, num_heads * d)
-    # Debug hooks captured
-    assert m._dbg_attend_block is not None
-    assert m._dbg_video_shape == (f, h, w)
-    assert m._dbg_block_size == block
 
     # Independent reference: same lifted-mask SDPA on (B, n, L, d) layout
     from einops import rearrange
@@ -486,6 +478,25 @@ def test_forward_end_to_end_clean_sdpa_chunked():
     out_ref_nd = m._inverse_permute_and_crop(out_ref_blocked, (f, h, w), info)
     out_ref = rearrange(out_ref_nd, "b n l d -> b l (n d)")
     assert torch.allclose(out, out_ref, atol=1e-5)
+
+
+def test_forward_records_attend_block_when_enabled():
+    torch.manual_seed(23)
+    num_heads, d = 2, 4
+    f, h, w = 4, 4, 4
+    L = f * h * w
+    q = torch.randn(1, L, num_heads * d, dtype=torch.float32)
+    k = torch.randn(1, L, num_heads * d, dtype=torch.float32)
+    v = torch.randn(1, L, num_heads * d, dtype=torch.float32)
+    m = _make_bsa(num_heads=num_heads, block=(2, 2, 2), sparse_ratio=0.5, backend="sdpa_chunked")
+    m.record_attend_block = True
+
+    m(q, k, v, (f, h, w))
+
+    assert m.last_attend_block.shape == (1, 1, 8, 8)
+    assert m.last_attend_block.dtype == torch.bool
+    assert m.last_video_shape == (f, h, w)
+    assert m.last_block_size == (2, 2, 2)
 
 
 def test_forward_end_to_end_boundary_sdpa_chunked():

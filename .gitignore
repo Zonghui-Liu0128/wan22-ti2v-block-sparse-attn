@@ -13,6 +13,8 @@
 *.msc
 *.mv
 log*.txt
+/outputs/
+/tests/bsa_viz/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

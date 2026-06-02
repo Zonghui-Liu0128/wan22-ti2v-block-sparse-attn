@@ -1,7 +1,12 @@
 """Wan2.2-TI2V-5B inference with optional Block Sparse Attention."""
 
 import argparse
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 from PIL import Image
@@ -27,8 +32,12 @@ def parse_args():
     p.add_argument("--height", type=int, default=832)
     p.add_argument("--width", type=int, default=480)
     p.add_argument("--frames", type=int, default=81)
-    p.add_argument("--steps", type=int, default=12)
+    p.add_argument("--steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--lora-checkpoint", default=None,
+                   help="Optional DiT LoRA checkpoint to load before BSA inference.")
+    p.add_argument("--lora-alpha", type=float, default=1.0,
+                   help="LoRA alpha passed to pipe.load_lora.")
     p.add_argument("--sparse-ratio", type=float, default=0.0,
                    help="Block-drop fraction (0 = dense baseline, 0.5 = drop half, etc.).")
     p.add_argument("--block-size", type=str, default="2,4,4",
@@ -131,6 +140,10 @@ def main():
         tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
         redirect_common_files=False,
     )
+
+    if args.lora_checkpoint:
+        pipe.load_lora(pipe.dit, args.lora_checkpoint, alpha=args.lora_alpha)
+        print(f"[lora] loaded {args.lora_checkpoint} with alpha={args.lora_alpha}")
 
     attention_recorder = None
     if args.sparse_ratio > 0.0:

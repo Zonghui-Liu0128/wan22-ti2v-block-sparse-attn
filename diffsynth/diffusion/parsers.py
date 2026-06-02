@@ -6,6 +6,9 @@ def add_dataset_base_config(parser: argparse.ArgumentParser):
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
+    parser.add_argument("--dataset_pin_memory", default=False, action="store_true", help="Enable DataLoader pinned memory.")
+    parser.add_argument("--dataset_persistent_workers", default=False, action="store_true", help="Keep DataLoader workers alive between epochs. Requires dataset_num_workers > 0.")
+    parser.add_argument("--dataset_prefetch_factor", type=int, default=None, help="DataLoader prefetch factor when dataset_num_workers > 0.")
     parser.add_argument("--data_file_keys", type=str, default="image,video", help="Data file keys in the metadata. Comma-separated.")
     return parser
 
@@ -37,6 +40,7 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--trainable_models", type=str, default=None, help="Models to train, e.g., dit, vae, text_encoder.")
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+    parser.add_argument("--optimizer_fused", default=False, action="store_true", help="Use fused AdamW when CUDA and the installed torch build support it.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
     return parser
 
@@ -44,6 +48,9 @@ def add_output_config(parser: argparse.ArgumentParser):
     parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
     parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
+    parser.add_argument("--log_steps", type=int, default=1, help="Training metric logging interval in micro steps.")
+    parser.add_argument("--disable_training_metrics", default=False, action="store_true", help="Disable CSV/JSONL/HTML training metrics.")
+    parser.add_argument("--enable_tensorboard", default=False, action="store_true", help="Write TensorBoard scalars under output_path/tensorboard.")
     return parser
 
 def add_lora_config(parser: argparse.ArgumentParser):

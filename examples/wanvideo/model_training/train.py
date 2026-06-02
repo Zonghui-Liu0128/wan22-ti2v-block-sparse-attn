@@ -1,9 +1,57 @@
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import torch, os, argparse, accelerate, warnings
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
+from diffsynth.models.wan_bsa import configure_wan_bsa, parse_bsa_block_size, set_wan_bsa_sparse_ratio
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def bsa_sparse_ratio_for_step(step, start, target, warmup_steps):
+    target = float(target)
+    if start is None or warmup_steps is None or int(warmup_steps) <= 0:
+        return target
+    start = float(start)
+    warmup_steps = int(warmup_steps)
+    if step >= warmup_steps:
+        return target
+    ratio = start + (target - start) * (float(step) / float(warmup_steps))
+    return round(ratio, 12)
+
+
+def _split_csv(value):
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def build_wan_special_operator_map(
+    dataset_base_path,
+    data_file_keys,
+    extra_inputs,
+    num_frames,
+    framewise_decoding=False,
+):
+    requested_keys = set(_split_csv(data_file_keys)) | set(_split_csv(extra_inputs))
+    special_operator_map = {
+        "animate_face_video": ToAbsolutePath(dataset_base_path) >> LoadVideo(
+            num_frames,
+            4,
+            1,
+            frame_processor=ImageCropAndResize(512, 512, None, 16, 16),
+        ),
+        "wantodance_music_path": ToAbsolutePath(dataset_base_path),
+    }
+    if "input_audio" in requested_keys:
+        special_operator_map["input_audio"] = ToAbsolutePath(dataset_base_path) >> LoadAudio(sr=16000)
+    return special_operator_map
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -24,6 +72,14 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        bsa_enable=False,
+        bsa_block_size=(2, 4, 4),
+        bsa_sparse_ratio=0.5,
+        bsa_sparse_ratio_start=None,
+        bsa_sparse_ratio_warmup_steps=0,
+        bsa_backend="flex",
+        bsa_sdpa_chunk_size=64,
+        redirect_common_files=True,
     ):
         super().__init__()
         # Warning
@@ -35,7 +91,30 @@ class WanTrainingModule(DiffusionTrainingModule):
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        self.pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            audio_processor_config=audio_processor_config,
+            redirect_common_files=redirect_common_files,
+        )
+        self.bsa_enable = bool(bsa_enable)
+        self.bsa_sparse_ratio_target = float(bsa_sparse_ratio)
+        self.bsa_sparse_ratio_start = None if bsa_sparse_ratio_start is None else float(bsa_sparse_ratio_start)
+        self.bsa_sparse_ratio_warmup_steps = int(bsa_sparse_ratio_warmup_steps or 0)
+        self.current_bsa_sparse_ratio = None
+        if self.bsa_enable:
+            self.bsa_block_size = parse_bsa_block_size(bsa_block_size)
+            self.bsa_backend = bsa_backend
+            self.bsa_sdpa_chunk_size = int(bsa_sdpa_chunk_size)
+            initial_sparse_ratio = bsa_sparse_ratio_for_step(
+                0,
+                self.bsa_sparse_ratio_start,
+                self.bsa_sparse_ratio_target,
+                self.bsa_sparse_ratio_warmup_steps,
+            )
+            self._configure_bsa(initial_sparse_ratio)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
         
@@ -63,6 +142,41 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+
+    def _configure_bsa(self, sparse_ratio):
+        total = 0
+        for model_name in ("dit", "dit2"):
+            total += configure_wan_bsa(
+                getattr(self.pipe, model_name, None),
+                enable=True,
+                block_size=self.bsa_block_size,
+                sparse_ratio=sparse_ratio,
+                backend=self.bsa_backend,
+                chunk_size=self.bsa_sdpa_chunk_size,
+            )
+        self.current_bsa_sparse_ratio = float(sparse_ratio)
+        print(
+            f"BSA enabled on {total} Wan blocks: block_size={self.bsa_block_size}, "
+            f"sparse_ratio={self.current_bsa_sparse_ratio}, backend={self.bsa_backend}, "
+            f"sdpa_chunk_size={self.bsa_sdpa_chunk_size}"
+        )
+
+    def on_train_step_start(self, global_step, total_steps=None):
+        if not self.bsa_enable:
+            return
+        sparse_ratio = bsa_sparse_ratio_for_step(
+            global_step,
+            self.bsa_sparse_ratio_start,
+            self.bsa_sparse_ratio_target,
+            self.bsa_sparse_ratio_warmup_steps,
+        )
+        if self.current_bsa_sparse_ratio == sparse_ratio:
+            return
+        updated = 0
+        for model_name in ("dit", "dit2"):
+            updated += set_wan_bsa_sparse_ratio(getattr(self.pipe, model_name, None), sparse_ratio)
+        if updated > 0:
+            self.current_bsa_sparse_ratio = sparse_ratio
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -123,6 +237,14 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
+    parser.add_argument("--disable_common_file_redirect", default=False, action="store_true", help="Disable Wan common-file redirection so existing original .pth files are reused.")
+    parser.add_argument("--bsa_enable", default=False, action="store_true", help="Enable Block Sparse Attention in Wan self-attention during training.")
+    parser.add_argument("--bsa_block_size", type=str, default="2,4,4", help="BSA block size as 'bt,bh,bw'. Use '2,2,3' for the 480x832@81 high-sparsity experiment.")
+    parser.add_argument("--bsa_sparse_ratio", type=float, default=0.5, help="Target BSA block drop ratio.")
+    parser.add_argument("--bsa_sparse_ratio_start", type=float, default=None, help="Optional warmup start ratio. If omitted, training starts at bsa_sparse_ratio.")
+    parser.add_argument("--bsa_sparse_ratio_warmup_steps", type=int, default=0, help="Micro steps used to linearly warm sparse ratio from start to target.")
+    parser.add_argument("--bsa_backend", type=str, choices=["flex", "sdpa_chunked"], default="flex", help="BSA attention backend.")
+    parser.add_argument("--bsa_sdpa_chunk_size", type=int, default=64, help="Requested query-block chunk size for BSA sdpa_chunked backend.")
     return parser
 
 
@@ -149,11 +271,13 @@ if __name__ == "__main__":
             time_division_factor=4 if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
         ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
-        }
+        special_operator_map=build_wan_special_operator_map(
+            dataset_base_path=args.dataset_base_path,
+            data_file_keys=args.data_file_keys,
+            extra_inputs=args.extra_inputs,
+            num_frames=args.num_frames,
+            framewise_decoding=args.framewise_decoding,
+        )
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
@@ -178,6 +302,14 @@ if __name__ == "__main__":
         device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        bsa_enable=args.bsa_enable,
+        bsa_block_size=args.bsa_block_size,
+        bsa_sparse_ratio=args.bsa_sparse_ratio,
+        bsa_sparse_ratio_start=args.bsa_sparse_ratio_start,
+        bsa_sparse_ratio_warmup_steps=args.bsa_sparse_ratio_warmup_steps,
+        bsa_backend=args.bsa_backend,
+        bsa_sdpa_chunk_size=args.bsa_sdpa_chunk_size,
+        redirect_common_files=not args.disable_common_file_redirect,
     )
     model_logger = ModelLogger(
         args.output_path,

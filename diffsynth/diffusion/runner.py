@@ -3,6 +3,7 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
+from .training_metrics import TrainingMetricsWriter, compute_wan_video_tokens
 from diffsynth.core import OffloadTrainingManager
 
 
@@ -31,9 +32,27 @@ def launch_training_task(
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
 
-    optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
+    trainable_params = list(model.trainable_modules())
+    optimizer_kwargs = {}
+    if args is not None and getattr(args, "optimizer_fused", False) and torch.cuda.is_available():
+        optimizer_kwargs["fused"] = True
+    try:
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay, **optimizer_kwargs)
+    except TypeError:
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader_kwargs = {
+        "shuffle": True,
+        "collate_fn": lambda x: x[0],
+        "num_workers": num_workers,
+    }
+    if args is not None:
+        dataloader_kwargs["pin_memory"] = getattr(args, "dataset_pin_memory", False)
+        if num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = getattr(args, "dataset_persistent_workers", False)
+            if getattr(args, "dataset_prefetch_factor", None) is not None:
+                dataloader_kwargs["prefetch_factor"] = args.dataset_prefetch_factor
+    dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
     if enable_model_cpu_offload:
         optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
@@ -43,9 +62,32 @@ def launch_training_task(
         model.to(device=accelerator.device)
         model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
+    tokens_per_sample = 0
+    if args is not None:
+        vae_factor = getattr(getattr(model.pipe, "vae", None), "upsampling_factor", 16)
+        patch_size = getattr(getattr(model.pipe, "dit", None), "patch_size", (1, 2, 2))
+        tokens_per_sample = compute_wan_video_tokens(
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            vae_upsampling_factor=vae_factor,
+            patch_size=patch_size,
+        )
+    metrics_writer = TrainingMetricsWriter(
+        model_logger.output_path,
+        enabled=(args is None or not getattr(args, "disable_training_metrics", False)) and accelerator.is_main_process,
+        tokens_per_sample=tokens_per_sample,
+        log_steps=1 if args is None else args.log_steps,
+        use_tensorboard=False if args is None else args.enable_tensorboard,
+    )
+
     initialize_deepspeed_gradient_checkpointing(accelerator)
+    global_step = 0
+    total_steps = len(dataloader) * num_epochs
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
+            if hasattr(model, "on_train_step_start"):
+                model.on_train_step_start(global_step, total_steps)
             with accelerator.accumulate(model):
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
@@ -58,10 +100,19 @@ def launch_training_task(
                 scheduler.step()
                 optimizer.zero_grad()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
+                global_step += 1
+                metrics_writer.log_step(
+                    step=global_step,
+                    loss=loss,
+                    learning_rate=scheduler.get_last_lr()[0],
+                    samples=accelerator.num_processes,
+                    bsa_sparse_ratio=getattr(model, "current_bsa_sparse_ratio", None),
+                )
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 
     model_logger.on_training_end(accelerator, model, save_steps)
+    metrics_writer.close()
 
 
 def launch_data_process_task(

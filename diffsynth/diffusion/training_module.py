@@ -1,72 +1,7 @@
-import torch, json, os, inspect
+import torch, json, os
 from ..core import ModelConfig, load_state_dict
 from ..utils.controlnet import ControlNetInput
-from .base_pipeline import PipelineUnit
 from peft import LoraConfig, inject_adapter_in_model
-
-
-class GeneralUnit_RemoveCache(PipelineUnit):
-    # Only used for training
-    def __init__(self, required_params=tuple(), force_remove_params_shared=tuple(), force_remove_params_posi=tuple(), force_remove_params_nega=tuple()):
-        super().__init__(take_over=True)
-        self.required_params = required_params
-        self.force_remove_params_shared = force_remove_params_shared
-        self.force_remove_params_posi = force_remove_params_posi
-        self.force_remove_params_nega = force_remove_params_nega
-
-    def process_params(self, inputs, required_params, force_remove_params):
-        inputs_ = {}
-        for name, param in inputs.items():
-            if name in required_params and name not in force_remove_params:
-                inputs_[name] = param
-        return inputs_
-
-    def process(self, pipe, inputs_shared, inputs_posi, inputs_nega):
-        inputs_shared = self.process_params(inputs_shared, self.required_params, self.force_remove_params_shared)
-        inputs_posi = self.process_params(inputs_posi, self.required_params, self.force_remove_params_posi)
-        inputs_nega = self.process_params(inputs_nega, self.required_params, self.force_remove_params_nega)
-        return inputs_shared, inputs_posi, inputs_nega
-
-
-class GeneralUnit_TemplateProcessInputs(PipelineUnit):
-    # Only used for training
-    def __init__(self, data_processor):
-        super().__init__(
-            input_params=("template_inputs",),
-            output_params=("template_inputs",),
-        )
-        self.data_processor = data_processor
-    
-    def process(self, pipe, template_inputs):
-        if not hasattr(pipe, "template_model") or template_inputs is None:
-            return {}
-        if self.data_processor is not None:
-            template_inputs = self.data_processor(**template_inputs)
-        template_inputs = pipe.template_model.process_inputs(pipe=pipe, **template_inputs)
-        return {"template_inputs": template_inputs}
-
-
-class GeneralUnit_TemplateForward(PipelineUnit):
-    # Only used for training
-    def __init__(self, use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False):
-        super().__init__(
-            input_params=("template_inputs",),
-            output_params=("kv_cache",),
-            onload_model_names=("template_model",)
-        )
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
-    
-    def process(self, pipe, template_inputs):
-        if not hasattr(pipe, "template_model") or template_inputs is None:
-            return {}
-        template_cache = pipe.template_model.forward(
-            **template_inputs,
-            pipe=pipe,
-            use_gradient_checkpointing=self.use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload,
-        )
-        return template_cache
 
 
 class DiffusionTrainingModule(torch.nn.Module):
@@ -251,16 +186,6 @@ class DiffusionTrainingModule(torch.nn.Module):
         else:
             lora_target_modules = lora_target_modules.split(",")
         return lora_target_modules
-    
-
-    def load_training_template_model(self, pipe, path_or_model_id, use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False):
-        if path_or_model_id is None:
-            return pipe
-        model_config = self.parse_path_or_model_id(path_or_model_id)
-        pipe.load_training_template_model(model_config)
-        pipe.units.append(GeneralUnit_TemplateProcessInputs(pipe.template_data_processor))
-        pipe.units.append(GeneralUnit_TemplateForward(use_gradient_checkpointing, use_gradient_checkpointing_offload))
-        return pipe
 
 
     def switch_pipe_to_training_mode(
@@ -287,13 +212,12 @@ class DiffusionTrainingModule(torch.nn.Module):
         
         # Add LoRA to the base models
         if lora_base_model is not None and not task.endswith(":data_process"):
-            if lora_base_model != "" and ((not hasattr(pipe, lora_base_model)) or getattr(pipe, lora_base_model) is None):
+            if (not hasattr(pipe, lora_base_model)) or getattr(pipe, lora_base_model) is None:
                 print(f"No {lora_base_model} models in the pipeline. We cannot patch LoRA on the model. If this occurs during the data processing stage, it is normal.")
                 return
-            model = pipe if lora_base_model == "" else getattr(pipe, lora_base_model)
             model = self.add_lora_to_model(
-                model,
-                target_modules=self.parse_lora_target_modules(model, lora_target_modules),
+                getattr(pipe, lora_base_model),
+                target_modules=self.parse_lora_target_modules(getattr(pipe, lora_base_model), lora_target_modules),
                 lora_rank=lora_rank,
                 upcast_dtype=pipe.torch_dtype,
             )
@@ -306,37 +230,20 @@ class DiffusionTrainingModule(torch.nn.Module):
                 lora = lora_loader.convert_state_dict(lora)
                 lora = self.mapping_lora_state_dict(lora)
                 load_result = model.load_state_dict(lora, strict=False)
-                print(f"LoRA checkpoint loaded. Total {len(lora)} keys")
+                print(f"LoRA checkpoint loaded: {lora_checkpoint}, total {len(lora)} keys")
                 if len(load_result[1]) > 0:
                     print(f"Warning, LoRA key mismatch! Unexpected keys in LoRA checkpoint: {load_result[1]}")
-            if lora_base_model != "":
-                setattr(pipe, lora_base_model, model)
+            setattr(pipe, lora_base_model, model)
 
 
-    def split_pipeline_units(
-        self, task, pipe,
-        trainable_models=None, lora_base_model=None,
-        # TODO: set `remove_unnecessary_params` to `True` by default
-        remove_unnecessary_params=False,
-        # TODO: move `loss_required_params` to `loss.py`
-        loss_required_params=("input_latents", "max_timestep_boundary", "min_timestep_boundary", "first_frame_latents", "video_latents", "audio_input_latents", "num_inference_steps"),
-        force_remove_params_shared=tuple(),
-        force_remove_params_posi=tuple(),
-        force_remove_params_nega=tuple(),
-    ):
+    def split_pipeline_units(self, task, pipe, trainable_models=None, lora_base_model=None):
         models_require_backward = []
         if trainable_models is not None:
             models_require_backward += trainable_models.split(",")
         if lora_base_model is not None:
             models_require_backward += [lora_base_model]
         if task.endswith(":data_process"):
-            other_units, pipe.units = pipe.split_pipeline_units(models_require_backward)
-            if remove_unnecessary_params:
-                required_params = list(loss_required_params) + [i for i in inspect.signature(self.pipe.model_fn).parameters]
-                for unit in other_units:
-                    required_params.extend(unit.fetch_input_params())
-                required_params = sorted(list(set(required_params)))
-                pipe.units.append(GeneralUnit_RemoveCache(required_params, force_remove_params_shared, force_remove_params_posi, force_remove_params_nega))
+            _, pipe.units = pipe.split_pipeline_units(models_require_backward)
         elif task.endswith(":train"):
             pipe.units, _ = pipe.split_pipeline_units(models_require_backward)
         return pipe

@@ -12,6 +12,7 @@ from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 from diffsynth.models.wan_bsa import configure_wan_bsa, parse_bsa_block_size, set_wan_bsa_sparse_ratio
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import glob
 
 
 def bsa_sparse_ratio_for_step(step, start, target, warmup_steps):
@@ -30,6 +31,26 @@ def _split_csv(value):
     if value is None:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def build_internal_wan_model_configs(model_paths, dit_only=False, tokenizer_path=None):
+    """Build the Wan2.2-TI2V-5B local-directory configs used by the H100 intranet script."""
+    if model_paths is None:
+        return None, None
+    model_root = os.path.abspath(os.path.expanduser(model_paths))
+    diffusion_paths = sorted(glob.glob(os.path.join(model_root, "diffusion_pytorch_model*.safetensors")))
+    model_configs = [ModelConfig(path=diffusion_paths, offload_device="cpu")]
+    tokenizer_config = None
+    if not dit_only:
+        model_configs.extend([
+            ModelConfig(path=os.path.join(model_root, "models_t5_umt5-xxl-enc-bf16.pth"), offload_device="cpu"),
+            ModelConfig(path=os.path.join(model_root, "Wan2.2_VAE.pth"), offload_device="cpu"),
+        ])
+        tokenizer_config = ModelConfig(
+            path=os.path.join(model_root, "google", "umt5-xxl") if tokenizer_path is None else tokenizer_path,
+            offload_device="cpu",
+        )
+    return model_configs, tokenizer_config
 
 
 def build_wan_special_operator_map(
@@ -87,9 +108,21 @@ class WanTrainingModule(DiffusionTrainingModule):
             warnings.warn("Gradient checkpointing is detected as disabled. To prevent out-of-memory errors, the training framework will forcibly enable gradient checkpointing.")
             use_gradient_checkpointing = True
 
-        # Load models
-        model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
-        tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
+        if model_paths is not None and not model_paths.lstrip().startswith("["):
+            model_configs, tokenizer_config = build_internal_wan_model_configs(
+                model_paths,
+                dit_only=task.endswith(":train"),
+                tokenizer_path=tokenizer_path,
+            )
+        else:
+            model_configs = self.parse_model_configs(
+                model_paths,
+                model_id_with_origin_paths,
+                fp8_models=fp8_models,
+                offload_models=offload_models,
+                device=device,
+            )
+            tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
@@ -99,6 +132,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             audio_processor_config=audio_processor_config,
             redirect_common_files=redirect_common_files,
         )
+
         self.bsa_enable = bool(bsa_enable)
         self.bsa_sparse_ratio_target = float(bsa_sparse_ratio)
         self.bsa_sparse_ratio_start = None if bsa_sparse_ratio_start is None else float(bsa_sparse_ratio_start)
@@ -117,7 +151,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             self._configure_bsa(initial_sparse_ratio)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         self.resume_from_checkpoint(resume_from_checkpoint, remove_prefix_in_ckpt)
-        
+
         # Training mode
         self.switch_pipe_to_training_mode(
             self.pipe, trainable_models,
@@ -188,9 +222,6 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared[extra_input] = data[extra_input][0]
             else:
                 inputs_shared[extra_input] = data[extra_input]
-        if inputs_shared.get("framewise_decoding", False):
-            # WanToDance global model
-            inputs_shared["num_frames"] = 4 * (len(data["video"]) - 1) + 1
         return inputs_shared
     
     def get_pipeline_inputs(self, data):
@@ -239,7 +270,7 @@ def wan_parser():
     parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
     parser.add_argument("--disable_common_file_redirect", default=False, action="store_true", help="Disable Wan common-file redirection so existing original .pth files are reused.")
     parser.add_argument("--bsa_enable", default=False, action="store_true", help="Enable Block Sparse Attention in Wan self-attention during training.")
-    parser.add_argument("--bsa_block_size", type=str, default="2,4,4", help="BSA block size as 'bt,bh,bw'. Use '2,2,3' for the 480x832@81 high-sparsity experiment.")
+    parser.add_argument("--bsa_block_size", type=str, default="2,4,4", help="BSA block size as 'bt,bh,bw'.")
     parser.add_argument("--bsa_sparse_ratio", type=float, default=0.5, help="Target BSA block drop ratio.")
     parser.add_argument("--bsa_sparse_ratio_start", type=float, default=None, help="Optional warmup start ratio. If omitted, training starts at bsa_sparse_ratio.")
     parser.add_argument("--bsa_sparse_ratio_warmup_steps", type=int, default=0, help="Micro steps used to linearly warm sparse ratio from start to target.")

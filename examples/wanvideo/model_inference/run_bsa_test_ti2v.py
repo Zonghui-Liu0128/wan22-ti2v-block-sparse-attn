@@ -1,6 +1,8 @@
 """Wan2.2-TI2V-5B inference with optional Block Sparse Attention."""
 
 import argparse
+import glob
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +36,12 @@ def parse_args():
     p.add_argument("--frames", type=int, default=81)
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--model-paths", default=None,
+                   help="Optional local Wan2.2-TI2V-5B directory containing DiT shards, T5, VAE, and optionally google/umt5-xxl.")
+    p.add_argument("--tokenizer-path", default=None,
+                   help="Optional local tokenizer directory. Defaults to model-paths/google/umt5-xxl when model-paths is set.")
+    p.add_argument("--disable-common-file-redirect", action="store_true",
+                   help="Disable Wan common-file redirection so original local .pth files are reused.")
     p.add_argument("--lora-checkpoint", default=None,
                    help="Optional DiT LoRA checkpoint to load before BSA inference.")
     p.add_argument("--lora-alpha", type=float, default=1.0,
@@ -48,6 +56,27 @@ def parse_args():
     p.add_argument("--dump-attention-png", default=None,
                    help="Save the first DiT block's final block-level BSA mask as a PNG.")
     return p.parse_args()
+
+
+def build_model_configs(model_paths, tokenizer_path=None):
+    if model_paths is None:
+        return [
+            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
+            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
+            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth"),
+        ], ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/")
+
+    model_root = os.path.abspath(os.path.expanduser(model_paths))
+    diffusion_paths = sorted(glob.glob(os.path.join(model_root, "diffusion_pytorch_model*.safetensors")))
+    model_configs = [
+        ModelConfig(path=os.path.join(model_root, "models_t5_umt5-xxl-enc-bf16.pth")),
+        ModelConfig(path=diffusion_paths),
+        ModelConfig(path=os.path.join(model_root, "Wan2.2_VAE.pth")),
+    ]
+    tokenizer_config = ModelConfig(
+        path=os.path.join(model_root, "google", "umt5-xxl") if tokenizer_path is None else tokenizer_path
+    )
+    return model_configs, tokenizer_config
 
 
 def parse_block_size(s):
@@ -129,16 +158,13 @@ def main():
             "Use --block-size 2,4,4 or --bsa-backend sdpa_chunked."
         )
 
+    model_configs, tokenizer_config = build_model_configs(args.model_paths, args.tokenizer_path)
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device="cuda",
-        model_configs=[
-            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-            ModelConfig(model_id="Wan-AI/Wan2.2-TI2V-5B", origin_file_pattern="Wan2.2_VAE.pth"),
-        ],
-        tokenizer_config=ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
-        redirect_common_files=False,
+        model_configs=model_configs,
+        tokenizer_config=tokenizer_config,
+        redirect_common_files=not args.disable_common_file_redirect,
     )
 
     if args.lora_checkpoint:

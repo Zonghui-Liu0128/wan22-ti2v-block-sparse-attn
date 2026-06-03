@@ -1,0 +1,6 @@
+video_shape=(5, 4, 4)
+block_size=(3, 7, 3)
+sparse_ratio=0.85
+num_blocks=4
+drop_blocks_per_row=3
+colors=yellow:keep,purple:drop

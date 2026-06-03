@@ -4,18 +4,13 @@ from typing_extensions import Literal
 
 class FlowMatchScheduler():
 
-    def __init__(self, template: Literal["FLUX.1", "Wan", "Qwen-Image", "FLUX.2", "Z-Image", "LTX-2", "Qwen-Image-Lightning", "ERNIE-Image", "ACE-Step"] = "FLUX.1"):
+    def __init__(self, template: Literal["FLUX.1", "Wan", "Qwen-Image", "FLUX.2", "Z-Image"] = "FLUX.1"):
         self.set_timesteps_fn = {
             "FLUX.1": FlowMatchScheduler.set_timesteps_flux,
             "Wan": FlowMatchScheduler.set_timesteps_wan,
             "Qwen-Image": FlowMatchScheduler.set_timesteps_qwen_image,
             "FLUX.2": FlowMatchScheduler.set_timesteps_flux2,
             "Z-Image": FlowMatchScheduler.set_timesteps_z_image,
-            "LTX-2": FlowMatchScheduler.set_timesteps_ltx2,
-            "Qwen-Image-Lightning": FlowMatchScheduler.set_timesteps_qwen_image_lightning,
-            "ERNIE-Image": FlowMatchScheduler.set_timesteps_ernie_image,
-            "ACE-Step": FlowMatchScheduler.set_timesteps_ace_step,
-            "HiDream-O1-Image": FlowMatchScheduler.set_timesteps_hidream_o1_image,
         }.get(template, FlowMatchScheduler.set_timesteps_flux)
         self.num_train_timesteps = 1000
 
@@ -30,7 +25,7 @@ class FlowMatchScheduler():
         sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
         timesteps = sigmas * num_train_timesteps
         return sigmas, timesteps
-    
+
     @staticmethod
     def set_timesteps_wan(num_inference_steps=100, denoising_strength=1.0, shift=None):
         sigma_min = 0.0
@@ -42,7 +37,7 @@ class FlowMatchScheduler():
         sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
         timesteps = sigmas * num_train_timesteps
         return sigmas, timesteps
-    
+
     @staticmethod
     def _calculate_shift_qwen_image(image_seq_len, base_seq_len=256, max_seq_len=8192, base_shift=0.5, max_shift=0.9):
         m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
@@ -71,28 +66,6 @@ class FlowMatchScheduler():
         one_minus_z = 1 - sigmas
         scale_factor = one_minus_z[-1] / (1 - shift_terminal)
         sigmas = 1 - (one_minus_z / scale_factor)
-        # Timesteps
-        timesteps = sigmas * num_train_timesteps
-        return sigmas, timesteps
-    
-    @staticmethod
-    def set_timesteps_qwen_image_lightning(num_inference_steps=100, denoising_strength=1.0, exponential_shift_mu=None, dynamic_shift_len=None):
-        sigma_min = 0.0
-        sigma_max = 1.0
-        num_train_timesteps = 1000
-        base_shift = math.log(3)
-        max_shift = math.log(3)
-        # Sigmas
-        sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength
-        sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps + 1)[:-1]
-        # Mu
-        if exponential_shift_mu is not None:
-            mu = exponential_shift_mu
-        elif dynamic_shift_len is not None:
-            mu = FlowMatchScheduler._calculate_shift_qwen_image(dynamic_shift_len, base_shift=base_shift, max_shift=max_shift)
-        else:
-            mu = 0.8
-        sigmas = math.exp(mu) / (math.exp(mu) + (1 / sigmas - 1))
         # Timesteps
         timesteps = sigmas * num_train_timesteps
         return sigmas, timesteps
@@ -133,28 +106,6 @@ class FlowMatchScheduler():
         return sigmas, timesteps
 
     @staticmethod
-    def set_timesteps_ernie_image(num_inference_steps=50, denoising_strength=1.0, shift=3.0):
-        sigma_min = 0.0
-        sigma_max = 1.0
-        num_train_timesteps = 1000
-        sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength
-        sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps + 1)[:-1]
-        if shift is not None and shift != 1.0:
-            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-        timesteps = sigmas * num_train_timesteps
-        return sigmas, timesteps
-
-    @staticmethod
-    def set_timesteps_ace_step(num_inference_steps=8, denoising_strength=1.0, shift=3.0):
-        num_train_timesteps = 1000
-        sigma_start = denoising_strength
-        sigmas = torch.linspace(sigma_start, 0.0, num_inference_steps + 1)[:-1]
-        if shift is not None and shift != 1.0:
-            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-        timesteps = sigmas * num_train_timesteps
-        return sigmas, timesteps
-
-    @staticmethod
     def set_timesteps_z_image(num_inference_steps=100, denoising_strength=1.0, shift=None, target_timesteps=None):
         sigma_min = 0.0
         sigma_max = 1.0
@@ -169,67 +120,6 @@ class FlowMatchScheduler():
             for timestep in target_timesteps:
                 timestep_id = torch.argmin((timesteps - timestep).abs())
                 timesteps[timestep_id] = timestep
-        return sigmas, timesteps
-
-    @staticmethod
-    def set_timesteps_joyai_image(num_inference_steps=100, denoising_strength=1.0, shift=None):
-        sigma_min = 0.0
-        sigma_max = 1.0
-        shift = 4.0 if shift is None else shift
-        num_train_timesteps = 1000
-        sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength
-        sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps + 1)[:-1]
-        sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-        timesteps = sigmas * num_train_timesteps
-        return sigmas, timesteps
-
-    @staticmethod
-    def set_timesteps_hidream_o1_image(num_inference_steps=28, denoising_strength=1.0, shift=None, special_case=None, **kwargs):
-        num_train_timesteps = 1000
-        shift = 3.0 if shift is None else shift
-        if special_case == "dev":
-            timesteps_list = [
-                999, 987, 974, 960, 945, 929, 913, 895, 877, 857, 836, 814, 790, 764, 737,
-                707, 675, 640, 602, 560, 515, 464, 409, 347, 278, 199, 110, 8,
-            ]
-            sigmas = torch.tensor([t / 1000.0 for t in timesteps_list], dtype=torch.float32)
-            timesteps = torch.tensor(timesteps_list, dtype=torch.float32)
-            return sigmas, timesteps
-        else:
-            sigma_min = 0.0
-            sigma_max = 1.0
-            sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength
-            sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps + 1)[:-1]
-            sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
-            timesteps = sigmas * num_train_timesteps
-            return sigmas, timesteps
-
-    @staticmethod
-    def set_timesteps_ltx2(num_inference_steps=100, denoising_strength=1.0, dynamic_shift_len=None, terminal=0.1, special_case=None):
-        num_train_timesteps = 1000
-        if special_case == "stage2":
-            sigmas = torch.Tensor([0.909375, 0.725, 0.421875])
-        elif special_case == "ditilled_stage1":
-            sigmas = torch.Tensor([1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875])
-        else:
-            dynamic_shift_len = dynamic_shift_len or 4096
-            sigma_shift = FlowMatchScheduler._calculate_shift_qwen_image(
-                image_seq_len=dynamic_shift_len,
-                base_seq_len=1024,
-                max_seq_len=4096,
-                base_shift=0.95,
-                max_shift=2.05,
-            )
-            sigma_min = 0.0
-            sigma_max = 1.0
-            sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength
-            sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps + 1)[:-1]
-            sigmas = math.exp(sigma_shift) / (math.exp(sigma_shift) + (1 / sigmas - 1))
-            # Shift terminal
-            one_minus_z = 1.0 - sigmas
-            scale_factor = one_minus_z[-1] / (1 - terminal)
-            sigmas = 1.0 - (one_minus_z / scale_factor)
-        timesteps = sigmas * num_train_timesteps
         return sigmas, timesteps
 
     def set_training_weight(self):

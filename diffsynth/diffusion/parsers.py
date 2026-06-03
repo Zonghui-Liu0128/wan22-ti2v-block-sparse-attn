@@ -41,6 +41,7 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--optimizer_fused", default=False, action="store_true", help="Use fused AdamW when CUDA and the installed torch build support it.")
+    parser.add_argument("--max_train_steps", type=int, default=None, help="Optional maximum number of optimizer steps for smoke tests or bounded runs.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
     return parser
 

@@ -4,9 +4,15 @@ import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
+import accelerate
+import yaml
 import torch
 
+from diffsynth.diffusion.runner import launch_training_task
+from diffsynth.diffusion.loss import FlowMatchSFTLoss
+from diffsynth.diffusion.training_module import DiffusionTrainingModule
 from diffsynth.diffusion.training_metrics import TrainingMetricsWriter, compute_wan_video_tokens
 from diffsynth.models.wan_bsa import (
     configure_wan_bsa,
@@ -15,7 +21,13 @@ from diffsynth.models.wan_bsa import (
 )
 from diffsynth.models.wan_video_dit import AttentionModule, BlockSparseAttention, WanModel
 from examples.wanvideo.model_inference.run_bsa_test_ti2v import parse_args as parse_bsa_inference_args
-from examples.wanvideo.model_training.train import bsa_sparse_ratio_for_step, build_wan_special_operator_map, wan_parser
+from examples.wanvideo.model_training.train import (
+    WanTrainingModule,
+    bsa_sparse_ratio_for_step,
+    build_internal_wan_model_configs,
+    build_wan_special_operator_map,
+    wan_parser,
+)
 from examples.wanvideo.model_training.prepare_hq_vsr_smoke_dataset import select_mp4_members
 
 
@@ -132,6 +144,7 @@ def test_wan_training_parser_accepts_bsa_logging_and_dataloader_flags():
         "--dataset_persistent_workers",
         "--dataset_prefetch_factor", "4",
         "--optimizer_fused",
+        "--max_train_steps", "20",
         "--disable_common_file_redirect",
     ])
 
@@ -148,7 +161,196 @@ def test_wan_training_parser_accepts_bsa_logging_and_dataloader_flags():
     assert args.dataset_persistent_workers is True
     assert args.dataset_prefetch_factor == 4
     assert args.optimizer_fused is True
+    assert args.max_train_steps == 20
     assert args.disable_common_file_redirect is True
+
+
+def test_internal_model_path_loader_builds_wan22_ti2v_configs_without_json(tmp_path):
+    model_dir = tmp_path / "Wan2.2-TI2V-5B"
+    model_dir.mkdir()
+    (model_dir / "diffusion_pytorch_model-00001-of-00002.safetensors").touch()
+    (model_dir / "diffusion_pytorch_model-00002-of-00002.safetensors").touch()
+
+    model_configs, tokenizer_config = build_internal_wan_model_configs(str(model_dir))
+
+    assert len(model_configs) == 3
+    assert sorted(Path(p).name for p in model_configs[0].path) == [
+        "diffusion_pytorch_model-00001-of-00002.safetensors",
+        "diffusion_pytorch_model-00002-of-00002.safetensors",
+    ]
+    assert Path(model_configs[1].path).name == "models_t5_umt5-xxl-enc-bf16.pth"
+    assert Path(model_configs[2].path).name == "Wan2.2_VAE.pth"
+    assert tokenizer_config.path.endswith("google/umt5-xxl")
+
+    _, explicit_tokenizer = build_internal_wan_model_configs(
+        str(model_dir),
+        tokenizer_path="/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+    )
+
+    assert explicit_tokenizer.path == "/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"
+
+    dit_only_configs, dit_only_tokenizer = build_internal_wan_model_configs(str(model_dir), dit_only=True)
+
+    assert len(dit_only_configs) == 1
+    assert sorted(Path(p).name for p in dit_only_configs[0].path) == [
+        "diffusion_pytorch_model-00001-of-00002.safetensors",
+        "diffusion_pytorch_model-00002-of-00002.safetensors",
+    ]
+    assert dit_only_tokenizer is None
+
+
+class _TinyDataset(torch.utils.data.Dataset):
+    load_from_cache = False
+
+    def __len__(self):
+        return 8
+
+    def __getitem__(self, index):
+        return {"x": torch.tensor(1.0)}
+
+
+class _TinyTrainingModule(DiffusionTrainingModule):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.pipe = SimpleNamespace(
+            device=torch.device("cpu"),
+            vae=None,
+            dit=SimpleNamespace(patch_size=(1, 2, 2)),
+        )
+
+    def forward(self, data, inputs=None):
+        return self.weight * data["x"]
+
+
+class _StepCountingLogger:
+    def __init__(self, output_path):
+        self.output_path = output_path
+        self.num_steps = 0
+        self.epoch_saves = 0
+
+    def on_step_end(self, accelerator, model, save_steps=None, **kwargs):
+        self.num_steps += 1
+
+    def on_epoch_end(self, accelerator, model, epoch_id):
+        self.epoch_saves += 1
+
+    def on_training_end(self, accelerator, model, save_steps=None):
+        pass
+
+
+def test_launch_training_task_stops_at_max_train_steps(tmp_path):
+    args = SimpleNamespace(
+        learning_rate=0.01,
+        weight_decay=0.0,
+        dataset_num_workers=0,
+        save_steps=None,
+        num_epochs=5,
+        max_train_steps=2,
+        enable_model_cpu_offload=False,
+        enable_optimizer_cpu_offload=False,
+        cpu_offload_split_threshold=None,
+        optimizer_fused=False,
+        dataset_pin_memory=False,
+        dataset_persistent_workers=False,
+        dataset_prefetch_factor=None,
+        height=16,
+        width=16,
+        num_frames=1,
+        disable_training_metrics=True,
+        log_steps=1,
+        enable_tensorboard=False,
+    )
+    logger = _StepCountingLogger(tmp_path)
+
+    launch_training_task(
+        accelerate.Accelerator(),
+        _TinyDataset(),
+        _TinyTrainingModule(),
+        logger,
+        args=args,
+    )
+
+    assert logger.num_steps == 2
+
+
+def test_wan_training_module_bsa_step_hook_updates_sparse_ratio_on_internal_model():
+    model = WanTrainingModule.__new__(WanTrainingModule)
+    model.bsa_enable = True
+    model.bsa_sparse_ratio_start = 0.85
+    model.bsa_sparse_ratio_target = 0.90
+    model.bsa_sparse_ratio_warmup_steps = 10
+    model.current_bsa_sparse_ratio = 0.85
+    model.pipe = type("Pipe", (), {})()
+    model.pipe.dit = _tiny_wan_model()
+    model.pipe.dit2 = None
+    model.bsa_block_size = parse_bsa_block_size("3,7,3")
+    model.bsa_backend = "sdpa_chunked"
+    model.bsa_sdpa_chunk_size = 64
+    model._configure_bsa(0.85)
+
+    model.on_train_step_start(global_step=5)
+
+    assert model.current_bsa_sparse_ratio == 0.875
+    for block in model.pipe.dit.blocks:
+        attn = block.self_attn.attn
+        assert isinstance(attn, BlockSparseAttention)
+        assert attn.block_size == (3, 7, 3)
+        assert attn.backend == "sdpa_chunked"
+        assert attn.sparse_ratio == 0.875
+
+
+def test_flow_match_sft_loss_keeps_first_frame_in_training_target(monkeypatch):
+    calls = {}
+
+    class Scheduler:
+        timesteps = torch.arange(1000, dtype=torch.float32)
+
+        def add_noise(self, original, noise, timestep):
+            return original + noise
+
+        def training_target(self, original, noise, timestep):
+            return noise - original
+
+        def training_weight(self, timestep):
+            return torch.tensor(1.0)
+
+    class Pipe:
+        scheduler = Scheduler()
+        torch_dtype = torch.float32
+        device = torch.device("cpu")
+        in_iteration_models = ("dit",)
+        dit = object()
+
+        def model_fn(self, **kwargs):
+            calls["latents_shape"] = kwargs["latents"].shape
+            return torch.zeros_like(kwargs["input_latents"])
+
+    input_latents = torch.ones(1, 1, 3, 2, 2)
+    loss = FlowMatchSFTLoss(
+        Pipe(),
+        input_latents=input_latents,
+        first_frame_latents=torch.full((1, 1, 1, 2, 2), 7.0),
+    )
+
+    assert calls["latents_shape"] == input_latents.shape
+    assert loss.ndim == 0
+
+
+def test_diffusion_training_module_keeps_resume_checkpoint_api():
+    assert hasattr(DiffusionTrainingModule, "resume_from_checkpoint")
+
+
+def test_h100_4gpu_accelerate_config_is_deepspeed_bf16_zero2():
+    config_path = Path(__file__).resolve().parents[1] / "config_wan22_5B.yaml"
+
+    config = yaml.safe_load(config_path.read_text())
+
+    assert config["distributed_type"] == "DEEPSPEED"
+    assert config["mixed_precision"] == "bf16"
+    assert config["num_processes"] == 4
+    assert config["deepspeed_config"]["zero_stage"] == 2
+    assert config["deepspeed_config"]["gradient_accumulation_steps"] == 1
 
 
 def test_bsa_inference_parser_accepts_lora_checkpoint(monkeypatch):
@@ -160,6 +362,11 @@ def test_bsa_inference_parser_accepts_lora_checkpoint(monkeypatch):
             "input.png",
             "--output",
             "output.mp4",
+            "--model-paths",
+            "/models/Wan-AI/Wan2.2-TI2V-5B",
+            "--tokenizer-path",
+            "/models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+            "--disable-common-file-redirect",
             "--lora-checkpoint",
             "models/train/step-100.safetensors",
             "--lora-alpha",
@@ -171,6 +378,9 @@ def test_bsa_inference_parser_accepts_lora_checkpoint(monkeypatch):
 
     assert args.lora_checkpoint == "models/train/step-100.safetensors"
     assert args.lora_alpha == 0.75
+    assert args.model_paths == "/models/Wan-AI/Wan2.2-TI2V-5B"
+    assert args.tokenizer_path.endswith("google/umt5-xxl")
+    assert args.disable_common_file_redirect is True
 
 
 def test_bsa_inference_script_help_runs_from_repo_root():
@@ -190,6 +400,7 @@ def test_bsa_inference_script_help_runs_from_repo_root():
 
     assert result.returncode == 0, result.stderr
     assert "--lora-checkpoint" in result.stdout
+    assert "--model-paths" in result.stdout
     assert "--sparse-ratio" in result.stdout
 
 

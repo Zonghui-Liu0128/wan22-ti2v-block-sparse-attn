@@ -1,105 +1,146 @@
-# BSA H100 Quickstart
+# Wan2.2-5B BSA LoRA 内网 H100 部署手册
 
-这份文档用于在内网 H100 服务器上快速启动 Wan2.2-TI2V-5B 的 BSA LoRA 训练、查看训练日志和做 evaluation。当前方案不是全参数微调，而是 DiT LoRA 训练，BSA 只替换 self-attention 的计算路径。
+这份手册面向内网 H100*4 环境，用于把原来的 Wan2.2-TI2V-5B full self-attention LoRA 训练切换到 BSA 训练，并保留内网训练效果对齐逻辑。
 
-## 改动概览
+## 一句话结论
 
-- `diffsynth/models/wan_bsa.py`：新增 Wan DiT self-attention 的 BSA 配置、恢复和 sparse ratio 更新工具。
-- `examples/wanvideo/model_training/train.py`：新增 BSA 训练参数、sparse ratio warmup、cached train 支持、视频任务下的音频依赖懒加载。
-- `diffsynth/diffusion/runner.py`：新增 fused AdamW、pin/persistent/prefetch dataloader、每步 metrics 写入和 BSA ratio 更新 hook。
-- `diffsynth/diffusion/training_metrics.py`：新增 `training_metrics.csv/jsonl/html` 和可选 TensorBoard；480x832@81 记为 `8190 tokens/video`。
-- `examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B-BSA.sh`：新增推荐训练脚本，先 cache，再用 cached data 训练 BSA LoRA。
-- `examples/wanvideo/model_inference/run_bsa_test_ti2v.py`：新增 BSA 推理入口，并支持 `--lora-checkpoint` / `--lora-alpha` 做 BSA+LoRA evaluation。
-- `examples/wanvideo/model_training/prepare_hq_vsr_smoke_dataset.py`：从 HQ-VSR zip 中抽样并转成 480x832@81 冒烟集。
+- 默认启动脚本仍走内网原始 `sft` 训练路径：每个 batch 现场跑 VAE/T5/DiT，首帧会被加噪并纳入 loss。
+- BSA 只替换 Wan DiT 的 self-attention 计算路径，不改变 LoRA target、loss 语义、数据字段和本地模型加载方式。
+- `USE_CACHE=1` 是可选优化：先 `sft:data_process` 缓存确定性的 VAE/T5 结果，再 `sft:train` 只跑 DiT+BSA+LoRA。只要缓存数据没有随机增强且模型/数据版本一致，训练目标和 direct `sft` 等价。
 
-## 数据和模型准备
+## 必须同步到内网的文件
 
-训练数据目录建议保持：
+把下面文件覆盖到内网 DiffSynth-Studio 对应路径：
 
 ```text
-/data/bsa_toy_480x832x81/
-  metadata.csv
-  videos/
-    xxx.mp4
+train_Wan2.2_5B_LoRA.sh
+config_wan22_5B.yaml
+examples/wanvideo/model_training/train.py
+examples/wanvideo/model_inference/run_bsa_test_ti2v.py
+diffsynth/models/wan_video_dit.py
+diffsynth/models/wan_bsa.py
+diffsynth/diffusion/parsers.py
+diffsynth/diffusion/runner.py
+diffsynth/diffusion/training_metrics.py
+diffsynth/diffusion/training_module.py
+diffsynth/diffusion/loss.py
+diffsynth/diffusion/flow_match.py
+tests/test_bsa_training_tools.py
+tests/test_wan_bsa_unit.py
 ```
 
-`metadata.csv` 至少包含：
+其中 `loss.py` 要重点确认：`FlowMatchSFTLoss` 不应把 `first_frame_latents` 覆盖到 noisy latents，也不应裁掉首帧 loss；这是对齐内网 full self-attn 训练效果的关键。
 
-```csv
-video,prompt
-videos/xxx.mp4,A high quality video of a toy rotating horizontally 360 degrees with stable color and fine details.
-```
+## `config_wan22_5B.yaml` 是什么
 
-确认模型文件在内网机器可被 DiffSynth 找到。默认脚本使用：
+`config_wan22_5B.yaml` 是 Accelerate 的启动配置，不是模型配置。它决定 `accelerate launch` 如何创建分布式训练进程。
+
+当前 H100*4 配置含义：
 
 ```text
-Wan-AI/Wan2.2-TI2V-5B:diffusion_pytorch_model*.safetensors
-Wan-AI/Wan2.2-TI2V-5B:models_t5_umt5-xxl-enc-bf16.pth
-Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth
+distributed_type: DEEPSPEED  使用 DeepSpeed
+num_processes: 4             本机 4 个 GPU 进程
+mixed_precision: bf16        H100 上用 bf16
+zero_stage: 2                ZeRO-2 分片优化器状态
+gradient_accumulation_steps: 1
+offload_*: none              不把参数/优化器 offload 到 CPU
 ```
 
-如果内网模型目录不同，直接改 `examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B-BSA.sh` 里的 `MODEL_CONFIGS` 和 `DIT_MODEL_CONFIG`。
+内网是 4 张 H100 时直接使用仓库根目录的 `config_wan22_5B.yaml`。如果临时只用 1 张卡测试，不能用这份 4 进程配置，需要另写 `num_processes: 1` 且 `distributed_type: 'NO'` 的 smoke 配置。
 
-## 快速启动训练
+## 启动训练
 
-推荐先在 `tmux` 里跑，避免 SSH 断开：
+默认配置已经写进 `train_Wan2.2_5B_LoRA.sh`：
+
+- 数据：`metadata_dataset_dolls_480p.csv`
+- 分辨率/帧数：`832x480@81`
+- 本地模型目录：`Wan2.2-TI2V-5B/`
+- LoRA：`rank=32`，target `q,k,v,o,ffn.0,ffn.2`
+- 初始 LoRA checkpoint：`models/step-66900.safetensors`
+- BSA：`block_size=3,7,3`，`backend=sdpa_chunked`，`sparse_ratio=0.85`
+- 日志：CSV/JSONL/HTML + TensorBoard
+
+直接启动：
 
 ```bash
 cd /path/to/DiffSynth-Studio
-tmux new -s bsa_h100
-
 conda activate diffsynth
 python -m pip install -e .
-python -m pip install peft ftfy tensorboard
+
+bash train_Wan2.2_5B_LoRA.sh 2>&1 | tee bsa_train.log
 ```
 
-配置路径：
+训练 90% 稀疏率：
 
 ```bash
-export DATASET_BASE_PATH=/data/bsa_toy_480x832x81
-export DATASET_METADATA_PATH=$DATASET_BASE_PATH/metadata.csv
-export CACHE_PATH=/data/cache/bsa_ti2v_480x832x81_cache
-export OUTPUT_PATH=/data/outputs/Wan2.2-TI2V-5B_bsa_lora
-
-# 强烈建议从已有 dense LoRA 起训；没有就留空。
-export LORA_CHECKPOINT=/data/outputs/Wan2.2-TI2V-5B_dense_lora/step-best.safetensors
-
-mkdir -p "$OUTPUT_PATH"
-bash examples/wanvideo/model_training/lora/Wan2.2-TI2V-5B-BSA.sh 2>&1 | tee "$OUTPUT_PATH/train.stdout.log"
+BSA_SPARSE_RATIO=0.90 bash train_Wan2.2_5B_LoRA.sh
 ```
 
-默认关键训练配置：
+从 85% warmup 到 90%：
 
-- LoRA：`rank=32`，target `q,k,v,o,ffn.0,ffn.2`
-- BSA：`block_size=2,2,3`，`backend=sdpa_chunked`，`chunk_size=64`
-- sparse ratio：`0.90 -> 0.95`，warmup `500` step
-- shape：`480x832@81`
-- batch 等效：单进程每 step 1 个视频
-- optimizer：fused AdamW
-- dataloader：pin memory、persistent workers、prefetch factor 4
+```bash
+BSA_SPARSE_RATIO_START=0.85 \
+BSA_SPARSE_RATIO=0.90 \
+BSA_SPARSE_RATIO_WARMUP_STEPS=500 \
+bash train_Wan2.2_5B_LoRA.sh
+```
 
-H100 上如果显存余量很大，可以先只把 `dataset_num_workers` 提到 8；再尝试把 `--bsa_sdpa_chunk_size` 从 64 提到 128。若 OOM，优先退回 64 或 32，不要先改分辨率和帧数。
+20 step 冒烟测试：
 
-## 查看日志和可视化
+```bash
+MAX_TRAIN_STEPS=20 SAVE_STEPS=20 OUTPUT_PATH=/path/to/smoke_out \
+bash train_Wan2.2_5B_LoRA.sh
+```
+
+可选缓存训练：
+
+```bash
+USE_CACHE=1 CACHE_PATH=/path/to/cache OUTPUT_PATH=/path/to/bsa_lora \
+bash train_Wan2.2_5B_LoRA.sh
+```
+
+缓存训练只建议在已经确认 direct `sft` 能跑通之后开启。它能省掉热路径里的 VAE/T5 计算，但正式效果对齐时先用 direct `sft` 更稳。
+
+## BSA 是如何接入训练的
+
+1. `WanTrainingModule` 加载模型后，在 LoRA 注入前调用 BSA 配置。
+2. `configure_wan_bsa()` 遍历 `pipe.dit` / `pipe.dit2` 的 Wan blocks，把每个 `SelfAttention.attn` 替换成 `BlockSparseAttention`。
+3. `BlockSparseAttention` 把 latent token 还原成 `(frames, height, width)` 3D 网格，按 `block_size=(3,7,3)` 分块。
+4. 每个 query block 用 Q/K block mean 算相似度，按 `sparse_ratio` 丢掉最不相关的 key blocks。
+5. `sdpa_chunked` 后端按 query block chunk 收集保留的 K/V tokens，再调用 PyTorch SDPA，避免构造完整 dense attention 矩阵。
+6. LoRA 仍注入在 DiT 的 `q,k,v,o,ffn.0,ffn.2`。反向传播经过 BSA attention 路径，只更新 LoRA 参数。
+7. `runner.py` 每个 step 调用 `model.on_train_step_start()`，可线性 warmup sparse ratio，并把当前 ratio 写入 metrics。
+
+和内网 full self-attn 版本的关键差异：
+
+```text
+full self-attn: SelfAttention -> dense SDPA -> LoRA 更新
+BSA LoRA:       SelfAttention -> BlockSparseAttention(sdpa_chunked) -> LoRA 更新
+```
+
+其他训练语义保持一致：
+
+- 本地目录式模型加载保持一致。
+- 默认 direct `sft` 热路径仍包含 VAE/T5。
+- 首帧加噪并进入 loss。
+- LoRA checkpoint 加载路径和内网脚本保持一致。
+
+## 查看 loss 和吞吐曲线
 
 训练输出目录会生成：
 
 ```text
-$OUTPUT_PATH/
-  step-*.safetensors
-  training_metrics.csv
-  training_metrics.jsonl
-  training_metrics.html
-  tensorboard/
-  train.stdout.log
+training_metrics.csv
+training_metrics.jsonl
+training_metrics.html
+tensorboard/
+step-*.safetensors
 ```
 
-命令行快速看：
+快速看 CSV：
 
 ```bash
-tail -f "$OUTPUT_PATH/train.stdout.log"
 tail -f "$OUTPUT_PATH/training_metrics.csv"
-watch -n 5 nvidia-smi
 ```
 
 HTML 曲线：
@@ -109,7 +150,7 @@ cd "$OUTPUT_PATH"
 python -m http.server 7860
 ```
 
-然后在浏览器打开：
+浏览器打开：
 
 ```text
 http://H100_SERVER_IP:7860/training_metrics.html
@@ -121,99 +162,104 @@ TensorBoard：
 tensorboard --logdir "$OUTPUT_PATH/tensorboard" --host 0.0.0.0 --port 6006
 ```
 
-CSV/HTML 中重点看：
-
-- `loss`
-- `tokens_per_hour` / `tokens_per_day`
-- `videos_per_hour` / `videos_per_day`
-- `bsa_sparse_ratio`
-- `step_seconds`
-
-480x832@81 的吞吐换算固定是 `8190 tokens/video`。
-
-## Evaluation
-
-每个 checkpoint 建议固定同一组 prompt、首帧、seed，对比 dense baseline 和 BSA 稀疏率 `0.90/0.93/0.95`。如果只有验证视频，先抽第一帧：
-
-```bash
-mkdir -p /data/eval/bsa
-ffmpeg -y -i /data/valid/toy_rotate.mp4 -frames:v 1 /data/eval/bsa/input.png
-```
-
-指定要评估的 checkpoint。当前训练器默认保存 `step-*.safetensors`，不会自动生成 `step-best.safetensors`：
-
-```bash
-export EVAL_CKPT="$OUTPUT_PATH/step-1000.safetensors"
-```
-
-Dense LoRA baseline：
-
-```bash
-python examples/wanvideo/model_inference/run_bsa_test_ti2v.py \
-  --image /data/eval/bsa/input.png \
-  --prompt "A high quality video of a toy rotating horizontally 360 degrees with stable color and fine details." \
-  --output /data/eval/bsa/step_best_dense.mp4 \
-  --height 480 \
-  --width 832 \
-  --frames 81 \
-  --steps 50 \
-  --seed 1 \
-  --lora-checkpoint "$EVAL_CKPT" \
-  --lora-alpha 1.0 \
-  --sparse-ratio 0
-```
-
-BSA target eval：
-
-```bash
-python examples/wanvideo/model_inference/run_bsa_test_ti2v.py \
-  --image /data/eval/bsa/input.png \
-  --prompt "A high quality video of a toy rotating horizontally 360 degrees with stable color and fine details." \
-  --output /data/eval/bsa/step_best_bsa095.mp4 \
-  --height 480 \
-  --width 832 \
-  --frames 81 \
-  --steps 50 \
-  --seed 1 \
-  --lora-checkpoint "$EVAL_CKPT" \
-  --lora-alpha 1.0 \
-  --sparse-ratio 0.95 \
-  --block-size 2,2,3 \
-  --bsa-backend sdpa_chunked \
-  --bsa-chunk-size 64 \
-  --dump-attention-png /data/eval/bsa/step_best_bsa095_mask.png
-```
-
-建议 evaluation 表格至少记录：
+重点列：
 
 ```text
-checkpoint | sparse_ratio | seed | steps | prompt_id | 是否完整 360 度 | 颜色是否漂移 | 细节是否丢失 | 是否崩坏
+loss
+step_seconds
+tokens_per_hour
+videos_per_day
+bsa_sparse_ratio
 ```
 
-选择 checkpoint 时，不只看最后一步。优先选 `0.95` 下还能保持稳定水平旋转、颜色不明显漂移、细节不明显糊掉的 checkpoint。
+Wan2.2-TI2V-5B 的吞吐口径：VAE spatial factor 16，DiT patch `(1,2,2)`。`832x480@81` 对应 latent frames `21`、patch grid `26x15`，即 `8190 tokens/video`。
 
-## 快速自检
+## 推理和 BSA mask 可视化
 
-训练前：
+从验证视频抽首帧：
 
 ```bash
-python examples/wanvideo/model_training/train.py --help | grep -E "bsa_|training_metrics|tensorboard|optimizer_fused"
-python examples/wanvideo/model_inference/run_bsa_test_ti2v.py --help | grep -E "lora|sparse|block"
+ffmpeg -y -i /path/to/valid.mp4 -frames:v 1 /path/to/input.png
 ```
 
-训练后：
+加载训练好的 LoRA，并导出 BSA mask：
 
 ```bash
-ls -lh "$OUTPUT_PATH"/training_metrics.*
-python - <<'PY'
-import csv, os
-p = os.environ["OUTPUT_PATH"] + "/training_metrics.csv"
-rows = list(csv.DictReader(open(p)))
-print("steps", len(rows))
-print("first_loss", rows[0]["loss"])
-print("last_loss", rows[-1]["loss"])
-print("last_tokens_per_hour", rows[-1]["tokens_per_hour"])
-print("last_videos_per_day", rows[-1]["videos_per_day"])
-print("last_bsa_sparse_ratio", rows[-1]["bsa_sparse_ratio"])
-PY
+python examples/wanvideo/model_inference/run_bsa_test_ti2v.py \
+  --image /path/to/input.png \
+  --prompt "A high quality video of a toy rotating horizontally 360 degrees with stable color and fine details." \
+  --output /path/to/eval_bsa085.mp4 \
+  --height 832 \
+  --width 480 \
+  --frames 81 \
+  --steps 50 \
+  --seed 1 \
+  --model-paths /path/to/Wan2.2-TI2V-5B \
+  --lora-checkpoint "$OUTPUT_PATH/step-XXXX.safetensors" \
+  --lora-alpha 1.0 \
+  --sparse-ratio 0.85 \
+  --block-size 3,7,3 \
+  --bsa-backend sdpa_chunked \
+  --bsa-chunk-size 64 \
+  --dump-attention-png /path/to/bsa_mask.png
 ```
+
+mask 颜色含义：
+
+```text
+yellow = 保留的 key block
+purple = 被丢弃的 key block
+```
+
+## 已保留的验证证据
+
+本仓库保留了 AutoDL 20-step 阶段验证文件，路径：
+
+```text
+docs/bsa_h100_verification/
+```
+
+内容：
+
+- `training_metrics.csv`：20 条 step 记录，最后 step 为 20。
+- `training_metrics.html`：loss/吞吐曲线可视化。
+- `training_metrics.jsonl`：逐步原始日志。
+- `bsa_mask_step20.png` / `.txt`：BSA mask 可视化和元数据。
+- `infer_step20_bsa.mp4`：加载 step-20 LoRA 后的 1-step BSA 推理 smoke。
+
+验证环境是 AutoDL A800 80GB，因为该实例只有 1 张 GPU；它验证的是代码链路，不代表 H100*4 吞吐。验证结论：
+
+```text
+BSA enabled on 30 Wan blocks
+block_size=(3,7,3)
+sparse_ratio=0.85
+backend=sdpa_chunked
+metrics rows=20
+last_step=20
+checkpoint=step-20.safetensors
+LoRA inference smoke passed
+```
+
+## 常见问题
+
+`No such file or directory: models/step-66900.safetensors`
+
+内网正式训练应确保该 checkpoint 存在。临时 smoke 不想加载 checkpoint 时：
+
+```bash
+LORA_CHECKPOINT= MAX_TRAIN_STEPS=20 bash train_Wan2.2_5B_LoRA.sh
+```
+
+`block_size=3,7,3` 为什么不用 flex？
+
+`flex` 在 CUDA 上对 block token product 有限制；`3*7*3=63` 不适合走 flex。这里固定用 `sdpa_chunked`。
+
+H100 上想跑 90% 稀疏率怎么办？
+
+```bash
+BSA_SPARSE_RATIO=0.90 BSA_BLOCK_SIZE=3,7,3 BSA_BACKEND=sdpa_chunked bash train_Wan2.2_5B_LoRA.sh
+```
+
+想进一步省显存怎么办？
+
+优先开启缓存训练 `USE_CACHE=1`，再降低 `BSA_SDPA_CHUNK_SIZE=32`。不要先改分辨率、帧数或 loss 逻辑。

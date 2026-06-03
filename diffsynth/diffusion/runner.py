@@ -31,6 +31,11 @@ def launch_training_task(
         enable_model_cpu_offload = args.enable_model_cpu_offload
         enable_optimizer_cpu_offload = args.enable_optimizer_cpu_offload
         cpu_offload_split_threshold = args.cpu_offload_split_threshold
+        max_train_steps = getattr(args, "max_train_steps", None)
+    else:
+        max_train_steps = None
+    if max_train_steps is not None and max_train_steps <= 0:
+        max_train_steps = None
 
     trainable_params = list(model.trainable_modules())
     optimizer_kwargs = {}
@@ -84,8 +89,14 @@ def launch_training_task(
     initialize_deepspeed_gradient_checkpointing(accelerator)
     global_step = 0
     total_steps = len(dataloader) * num_epochs
+    if max_train_steps is not None:
+        total_steps = min(total_steps, max_train_steps)
+    stop_training = False
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
+            if max_train_steps is not None and global_step >= max_train_steps:
+                stop_training = True
+                break
             if hasattr(model, "on_train_step_start"):
                 model.on_train_step_start(global_step, total_steps)
             with accelerator.accumulate(model):
@@ -108,8 +119,13 @@ def launch_training_task(
                     samples=accelerator.num_processes,
                     bsa_sparse_ratio=getattr(model, "current_bsa_sparse_ratio", None),
                 )
-        if save_steps is None:
+                if max_train_steps is not None and global_step >= max_train_steps:
+                    stop_training = True
+                    break
+        if not stop_training and save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
+        if stop_training:
+            break
 
     model_logger.on_training_end(accelerator, model, save_steps)
     metrics_writer.close()

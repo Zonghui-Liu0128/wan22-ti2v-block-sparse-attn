@@ -10,7 +10,7 @@ import accelerate
 import yaml
 import torch
 
-from diffsynth.diffusion.runner import launch_training_task
+from diffsynth.diffusion.runner import _get_offload_training_manager, launch_training_task
 from diffsynth.diffusion.loss import FlowMatchSFTLoss
 from diffsynth.diffusion.training_module import DiffusionTrainingModule
 from diffsynth.diffusion.training_metrics import TrainingMetricsWriter, compute_wan_video_tokens
@@ -272,6 +272,16 @@ def test_launch_training_task_stops_at_max_train_steps(tmp_path):
     )
 
     assert logger.num_steps == 2
+
+
+def test_runner_loads_offload_manager_when_core_init_does_not_export_it(monkeypatch):
+    import diffsynth.core
+
+    monkeypatch.delattr(diffsynth.core, "OffloadTrainingManager", raising=False)
+
+    manager_cls = _get_offload_training_manager()
+
+    assert manager_cls.__name__ == "OffloadTrainingManager"
 
 
 def test_wan_training_module_bsa_step_hook_updates_sparse_ratio_on_internal_model():

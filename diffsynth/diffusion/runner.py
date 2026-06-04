@@ -4,7 +4,14 @@ from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from .training_metrics import TrainingMetricsWriter, compute_wan_video_tokens
-from diffsynth.core import OffloadTrainingManager
+
+
+def _get_offload_training_manager():
+    try:
+        from diffsynth.core import OffloadTrainingManager
+    except ImportError:
+        from diffsynth.core.offload_training import OffloadTrainingManager
+    return OffloadTrainingManager
 
 
 def launch_training_task(
@@ -60,6 +67,7 @@ def launch_training_task(
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
     if enable_model_cpu_offload:
+        OffloadTrainingManager = _get_offload_training_manager()
         optimizer, dataloader, scheduler = accelerator.prepare(optimizer, dataloader, scheduler)
         model.pipe.device = accelerator.device
         offload_manager = OffloadTrainingManager(model, accelerator.device, enable_optimizer_cpu_offload, cpu_offload_split_threshold)
@@ -147,6 +155,7 @@ def launch_data_process_task(
         
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
     if enable_model_cpu_offload:
+        OffloadTrainingManager = _get_offload_training_manager()
         dataloader = accelerator.prepare(dataloader)
         offload_manager = OffloadTrainingManager(model, accelerator.device, enable_optimizer_cpu_offload, cpu_offload_split_threshold)
         model.pipe.device = accelerator.device

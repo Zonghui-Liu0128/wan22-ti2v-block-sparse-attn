@@ -20,6 +20,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 : "${NUM_EPOCHS:=1000}"
 : "${SAVE_STEPS:=400}"
 : "${MAX_TRAIN_STEPS:=}"
+: "${LEARNING_RATE:=3e-5}"
+: "${WEIGHT_DECAY:=0.0}"
 
 : "${LORA_BASE_MODEL:=dit}"
 : "${LORA_TARGET_MODULES:=q,k,v,o,ffn.0,ffn.2}"
@@ -115,6 +117,8 @@ fi
 
 train_args=(
   "${model_args[@]}"
+  --learning_rate "${LEARNING_RATE}"
+  --weight_decay "${WEIGHT_DECAY}"
   --num_epochs "${NUM_EPOCHS}"
   --save_steps "${SAVE_STEPS}"
   --remove_prefix_in_ckpt "pipe.dit."

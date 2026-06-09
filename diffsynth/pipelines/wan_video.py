@@ -194,6 +194,7 @@ class WanVideoPipeline(BasePipeline):
         negative_prompt: str = "",
         # Image-to-video
         input_image: Image.Image = None,
+        input_image_latent: Union[str, torch.Tensor, dict] = None,
         # First-last-frame-to-video
         end_image: Image.Image = None,
         # Video-to-video
@@ -265,7 +266,8 @@ class WanVideoPipeline(BasePipeline):
         framewise_decoding: bool = False,
         # progress_bar
         progress_bar_cmd=tqdm,
-        output_type: Literal["quantized", "floatpoint"] = "quantized",
+        output_type: Literal["quantized", "floatpoint", "latent"] = "quantized",
+        return_latents: bool = False,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
@@ -283,6 +285,7 @@ class WanVideoPipeline(BasePipeline):
         }
         inputs_shared = {
             "input_image": input_image,
+            "input_image_latent": input_image_latent,
             "end_image": end_image,
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
@@ -345,17 +348,23 @@ class WanVideoPipeline(BasePipeline):
         # post-denoising, pre-decoding processing logic
         for unit in self.post_units:
             inputs_shared, _, _ = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
+        final_latents = inputs_shared["latents"]
+        if output_type == "latent":
+            self.load_models_to_device([])
+            return final_latents
         # Decode
         self.load_models_to_device(['vae'])
         if framewise_decoding:
-            video = self.vae.decode_framewise(inputs_shared["latents"], device=self.device)
+            video = self.vae.decode_framewise(final_latents, device=self.device)
         else:
-            video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            video = self.vae.decode(final_latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if output_type == "quantized":
             video = self.vae_output_to_video(video)
         elif output_type == "floatpoint":
             pass
         self.load_models_to_device([])
+        if return_latents:
+            return video, final_latents
         return video
 
 
@@ -515,17 +524,54 @@ class WanVideoUnit_ImageEmbedderFused(PipelineUnit):
     """
     def __init__(self):
         super().__init__(
-            input_params=("input_image", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
+            input_params=("input_image", "input_image_latent", "latents", "height", "width", "tiled", "tile_size", "tile_stride"),
             output_params=("latents", "fuse_vae_embedding_in_latents", "first_frame_latents"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, input_image, latents, height, width, tiled, tile_size, tile_stride):
-        if input_image is None or not pipe.dit.fuse_vae_embedding_in_latents:
+    def load_precomputed_latent(self, input_image_latent, pipe, latents, height, width):
+        if isinstance(input_image_latent, str):
+            saved = torch.load(input_image_latent, map_location="cpu", weights_only=False)
+        else:
+            saved = input_image_latent
+
+        if isinstance(saved, dict):
+            if "height" in saved and int(saved["height"]) != int(height):
+                raise ValueError(f"input_image_latent height={saved['height']} does not match requested height={height}")
+            if "width" in saved and int(saved["width"]) != int(width):
+                raise ValueError(f"input_image_latent width={saved['width']} does not match requested width={width}")
+            if "latent" not in saved:
+                raise ValueError("input_image_latent dict must contain a 'latent' tensor")
+            z = saved["latent"]
+        else:
+            z = saved
+
+        if not torch.is_tensor(z):
+            raise TypeError("input_image_latent must be a path, tensor, or dict containing a tensor under 'latent'")
+        if z.ndim == 4:
+            z = z.unsqueeze(2)
+        elif z.ndim != 5:
+            raise ValueError(f"input_image_latent latent must have shape [B,C,H,W] or [B,C,F,H,W], got {tuple(z.shape)}")
+        if z.shape[2] != 1:
+            raise ValueError(f"input_image_latent must contain one latent frame, got F={z.shape[2]}")
+
+        expected_shape = (latents.shape[0], latents.shape[1], 1, latents.shape[3], latents.shape[4])
+        if tuple(z.shape) != tuple(expected_shape):
+            raise ValueError(
+                f"input_image_latent shape {tuple(z.shape)} does not match expected {expected_shape}. "
+                "For Wan2.2-TI2V-5B at 832x480, expected [1,48,1,52,30]."
+            )
+        return z.to(dtype=pipe.torch_dtype, device=pipe.device)
+
+    def process(self, pipe: WanVideoPipeline, input_image, input_image_latent, latents, height, width, tiled, tile_size, tile_stride):
+        if (input_image is None and input_image_latent is None) or not pipe.dit.fuse_vae_embedding_in_latents:
             return {}
-        pipe.load_models_to_device(self.onload_model_names)
-        image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
-        z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        if input_image_latent is not None:
+            z = self.load_precomputed_latent(input_image_latent, pipe, latents, height, width)
+        else:
+            pipe.load_models_to_device(self.onload_model_names)
+            image = pipe.preprocess_image(input_image.resize((width, height))).transpose(0, 1)
+            z = pipe.vae.encode([image], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         latents[:, :, 0: 1] = z
         return {"latents": latents, "fuse_vae_embedding_in_latents": True, "first_frame_latents": z}
 

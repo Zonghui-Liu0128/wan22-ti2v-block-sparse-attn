@@ -28,9 +28,17 @@ NEGATIVE_PROMPT = (
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run Wan2.2-TI2V-5B with optional Block Sparse Attention.")
-    p.add_argument("--image", required=True)
+    p.add_argument("--image", default=None,
+                   help="Optional first-frame image. Required unless --image-latent is provided.")
+    p.add_argument("--image-latent", default=None,
+                   help="Optional .pt saved by the RDP image encoder. Expected dict['latent'] shape: [1,48,H/16,W/16].")
     p.add_argument("--prompt", default=None)
-    p.add_argument("--output", required=True)
+    p.add_argument("--output", default=None,
+                   help="Output mp4 path. Required unless --skip-video-decode is used with --save-diffusion-latent.")
+    p.add_argument("--save-diffusion-latent", default=None,
+                   help="Save denoised Wan latent before VAE decode. Shape: [B,48,F,H/16,W/16].")
+    p.add_argument("--skip-video-decode", action="store_true",
+                   help="Return and save only the denoised latent, skipping Wan VAE decode and mp4 writing.")
     p.add_argument("--height", type=int, default=832)
     p.add_argument("--width", type=int, default=480)
     p.add_argument("--frames", type=int, default=81)
@@ -55,7 +63,49 @@ def parse_args():
                    help="chunk_size for sdpa_chunked backend.")
     p.add_argument("--dump-attention-png", default=None,
                    help="Save the first DiT block's final block-level BSA mask as a PNG.")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.image is None and args.image_latent is None:
+        p.error("one of --image or --image-latent is required")
+    if args.skip_video_decode and args.save_diffusion_latent is None:
+        p.error("--skip-video-decode requires --save-diffusion-latent")
+    if args.output is None and not args.skip_video_decode:
+        p.error("--output is required unless --skip-video-decode is set")
+    return args
+
+
+def build_diffusion_latent_save_obj(
+    latent,
+    image_path,
+    image_latent_path,
+    prompt,
+    negative_prompt,
+    lora_checkpoint,
+    lora_alpha,
+    height,
+    width,
+    num_frames,
+    seed,
+    steps,
+):
+    return {
+        "latent": latent.detach().cpu(),
+        "latent_role": "wan_diffusion_latent_after_denoise_unpatchified",
+        "latent_layout": "B C F H W",
+        "latent_shape": tuple(latent.shape),
+        "first_frame_latent_layout": "B C H W, unsqueeze dim=2 before pipeline use",
+        "image_path": None if image_path is None else str(image_path),
+        "image_latent_path": None if image_latent_path is None else str(image_latent_path),
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "lora_checkpoint": lora_checkpoint,
+        "lora_alpha": lora_alpha,
+        "height": height,
+        "width": width,
+        "num_frames": num_frames,
+        "seed": seed,
+        "steps": steps,
+        "dtype": str(latent.dtype),
+    }
 
 
 def build_model_configs(model_paths, tokenizer_path=None):
@@ -147,8 +197,9 @@ def save_attention_png(bsa, png_path, sparse_ratio):
 
 def main():
     args = parse_args()
-    image_path = Path(args.image)
-    prompt = args.prompt or image_path.stem.replace("_", " ")
+    image_path = None if args.image is None else Path(args.image)
+    prompt_source = image_path if image_path is not None else Path(args.image_latent)
+    prompt = args.prompt or prompt_source.stem.replace("_", " ")
     block_size = parse_block_size(args.block_size)
     block_tokens = block_size[0] * block_size[1] * block_size[2]
     if args.sparse_ratio > 0.0 and args.bsa_backend == "flex" and (block_tokens < 32 or block_tokens % 32 != 0):
@@ -183,8 +234,11 @@ def main():
     else:
         print("[bsa] sparse_ratio=0 -> dense baseline (AttentionModule untouched)")
 
-    input_image = Image.open(image_path).convert("RGB").resize((args.width, args.height))
-    video = pipe(
+    input_image = None
+    if image_path is not None:
+        input_image = Image.open(image_path).convert("RGB").resize((args.width, args.height))
+
+    result = pipe(
         prompt=prompt,
         negative_prompt=NEGATIVE_PROMPT,
         seed=args.seed,
@@ -192,14 +246,49 @@ def main():
         height=args.height,
         width=args.width,
         input_image=input_image,
+        input_image_latent=args.image_latent,
         num_frames=args.frames,
         num_inference_steps=args.steps,
+        output_type="latent" if args.skip_video_decode else "quantized",
+        return_latents=args.save_diffusion_latent is not None and not args.skip_video_decode,
     )
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    save_video(video, str(output_path), fps=15, quality=5)
-    print(f"Saved BSA TI2V output to {output_path}")
+    if args.skip_video_decode:
+        diffusion_latent = result
+        video = None
+    elif args.save_diffusion_latent is not None:
+        video, diffusion_latent = result
+    else:
+        video = result
+        diffusion_latent = None
+
+    if args.save_diffusion_latent is not None:
+        latent_path = Path(args.save_diffusion_latent)
+        latent_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            build_diffusion_latent_save_obj(
+                diffusion_latent,
+                image_path=image_path,
+                image_latent_path=args.image_latent,
+                prompt=prompt,
+                negative_prompt=NEGATIVE_PROMPT,
+                lora_checkpoint=args.lora_checkpoint,
+                lora_alpha=args.lora_alpha,
+                height=args.height,
+                width=args.width,
+                num_frames=args.frames,
+                seed=args.seed,
+                steps=args.steps,
+            ),
+            latent_path,
+        )
+        print(f"[latent] saved denoised diffusion latent to {latent_path}")
+
+    if video is not None and args.output is not None:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        save_video(video, str(output_path), fps=15, quality=5)
+        print(f"Saved BSA TI2V output to {output_path}")
     if args.dump_attention_png and attention_recorder is not None:
         save_attention_png(attention_recorder, args.dump_attention_png, args.sparse_ratio)
 

@@ -20,7 +20,9 @@ from diffsynth.models.wan_bsa import (
     set_wan_bsa_sparse_ratio,
 )
 from diffsynth.models.wan_video_dit import AttentionModule, BlockSparseAttention, WanModel
+from diffsynth.pipelines.wan_video import WanVideoUnit_ImageEmbedderFused
 from examples.wanvideo.model_inference.run_bsa_test_ti2v import parse_args as parse_bsa_inference_args
+from examples.wanvideo.model_inference.run_bsa_test_ti2v import build_diffusion_latent_save_obj
 from examples.wanvideo.model_training.train import (
     WanTrainingModule,
     bsa_sparse_ratio_for_step,
@@ -381,6 +383,101 @@ def test_bsa_inference_parser_accepts_lora_checkpoint(monkeypatch):
     assert args.model_paths == "/models/Wan-AI/Wan2.2-TI2V-5B"
     assert args.tokenizer_path.endswith("google/umt5-xxl")
     assert args.disable_common_file_redirect is True
+
+
+def test_fused_image_embedder_accepts_saved_rdp_latent_pt(tmp_path):
+    latent = torch.ones(1, 48, 52, 30, dtype=torch.float32)
+    latent_path = tmp_path / "first_frame_latent.pt"
+    torch.save(
+        {
+            "latent": latent,
+            "image_path": "/data/frame000.png",
+            "vae_ckpt_path": "/models/light_video_vae.pt",
+            "height": 832,
+            "width": 480,
+            "latent_shape": tuple(latent.shape),
+            "dtype": str(latent.dtype),
+        },
+        latent_path,
+    )
+    latents = torch.zeros(1, 48, 21, 52, 30, dtype=torch.bfloat16)
+
+    class Pipe:
+        device = "cpu"
+        torch_dtype = torch.bfloat16
+        dit = SimpleNamespace(fuse_vae_embedding_in_latents=True)
+
+        def load_models_to_device(self, model_names):
+            raise AssertionError("precomputed image latents should not load the Wan VAE")
+
+    out = WanVideoUnit_ImageEmbedderFused().process(
+        Pipe(),
+        input_image=None,
+        input_image_latent=str(latent_path),
+        latents=latents,
+        height=832,
+        width=480,
+        tiled=True,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+    )
+
+    assert out["fuse_vae_embedding_in_latents"] is True
+    assert out["first_frame_latents"].shape == (1, 48, 1, 52, 30)
+    assert out["first_frame_latents"].dtype == torch.bfloat16
+    assert torch.equal(out["latents"][:, :, 0:1], out["first_frame_latents"])
+
+
+def test_bsa_inference_parser_accepts_latent_only_output(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_bsa_test_ti2v.py",
+            "--image-latent",
+            "first_frame_latent.pt",
+            "--save-diffusion-latent",
+            "diffusion_latent.pt",
+            "--skip-video-decode",
+            "--model-paths",
+            "/models/Wan-AI/Wan2.2-TI2V-5B",
+        ],
+    )
+
+    args = parse_bsa_inference_args()
+
+    assert args.image is None
+    assert args.output is None
+    assert args.image_latent == "first_frame_latent.pt"
+    assert args.save_diffusion_latent == "diffusion_latent.pt"
+    assert args.skip_video_decode is True
+
+
+def test_diffusion_latent_save_obj_matches_decoder_handoff_contract():
+    latent = torch.zeros(1, 48, 21, 52, 30, dtype=torch.bfloat16)
+
+    save_obj = build_diffusion_latent_save_obj(
+        latent,
+        image_path="/data/frame000.png",
+        image_latent_path="/data/frame000_rdp_latent.pt",
+        prompt="test prompt",
+        negative_prompt="",
+        lora_checkpoint="/models/lora/step-100.safetensors",
+        lora_alpha=0.75,
+        height=832,
+        width=480,
+        num_frames=81,
+        seed=123,
+        steps=50,
+    )
+
+    assert save_obj["latent"].shape == (1, 48, 21, 52, 30)
+    assert save_obj["latent_layout"] == "B C F H W"
+    assert save_obj["latent_role"] == "wan_diffusion_latent_after_denoise_unpatchified"
+    assert save_obj["first_frame_latent_layout"] == "B C H W, unsqueeze dim=2 before pipeline use"
+    assert save_obj["height"] == 832
+    assert save_obj["width"] == 480
+    assert save_obj["num_frames"] == 81
+    assert save_obj["dtype"] == "torch.bfloat16"
 
 
 def test_bsa_inference_script_help_runs_from_repo_root():

@@ -23,6 +23,7 @@ from diffsynth.models.wan_video_dit import AttentionModule, BlockSparseAttention
 from diffsynth.pipelines.wan_video import WanVideoUnit_ImageEmbedderFused
 from examples.wanvideo.model_inference.run_bsa_test_ti2v import parse_args as parse_bsa_inference_args
 from examples.wanvideo.model_inference.run_bsa_test_ti2v import build_diffusion_latent_save_obj
+from examples.wanvideo.model_inference.infer_b200_rdp_latent import run_pipe_and_save_outputs
 from examples.wanvideo.model_training.train import (
     WanTrainingModule,
     bsa_sparse_ratio_for_step,
@@ -478,6 +479,47 @@ def test_diffusion_latent_save_obj_matches_decoder_handoff_contract():
     assert save_obj["width"] == 480
     assert save_obj["num_frames"] == 81
     assert save_obj["dtype"] == "torch.bfloat16"
+
+
+def test_simple_b200_entry_saves_latent_without_video_decode(tmp_path):
+    latent = torch.zeros(1, 48, 21, 52, 30, dtype=torch.bfloat16)
+    output_path = tmp_path / "wan_diffusion_latent.pt"
+
+    class Pipe:
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return latent
+
+    pipe = Pipe()
+    returned = run_pipe_and_save_outputs(
+        pipe=pipe,
+        input_image=None,
+        input_image_path="/data/frame000.png",
+        input_image_latent_path="/data/frame000_rdp_latent.pt",
+        prompt="test prompt",
+        negative_prompt="negative",
+        save_dir=None,
+        save_diffusion_latent_path=output_path,
+        skip_video_decode=True,
+        height=832,
+        width=480,
+        num_frames=81,
+        seed=1,
+        num_inference_steps=50,
+        cfg_scale=5,
+        lora_path="/models/lora.safetensors",
+    )
+
+    assert returned is latent
+    assert pipe.kwargs["input_image_latent"] == "/data/frame000_rdp_latent.pt"
+    assert pipe.kwargs["output_type"] == "latent"
+    assert pipe.kwargs["return_latents"] is False
+
+    saved = torch.load(output_path, map_location="cpu", weights_only=False)
+    assert saved["latent"].shape == (1, 48, 21, 52, 30)
+    assert saved["image_path"] == "/data/frame000.png"
+    assert saved["image_latent_path"] == "/data/frame000_rdp_latent.pt"
+    assert saved["latent_layout"] == "B C F H W"
 
 
 def test_bsa_inference_script_help_runs_from_repo_root():

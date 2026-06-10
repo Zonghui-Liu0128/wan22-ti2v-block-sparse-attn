@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import accelerate
 import yaml
 import torch
+from PIL import Image
 
 from diffsynth.diffusion.runner import launch_training_task
 from diffsynth.diffusion.loss import FlowMatchSFTLoss
@@ -478,6 +479,108 @@ def test_diffusion_latent_save_obj_matches_decoder_handoff_contract():
     assert save_obj["width"] == 480
     assert save_obj["num_frames"] == 81
     assert save_obj["dtype"] == "torch.bfloat16"
+
+
+def test_internal_infer_entry_forwards_rdp_latent_args(monkeypatch, tmp_path):
+    import infer
+
+    image_path = tmp_path / "frame000.png"
+    Image.new("RGB", (480, 832)).save(image_path)
+    metadata_path = tmp_path / "metadata.csv"
+    metadata_path.write_text("image,prompt\nframe000.png,test prompt\n")
+    save_dir = tmp_path / "out"
+    attention_png = tmp_path / "mask.png"
+
+    calls = {}
+
+    def fake_inference_video_b200(**kwargs):
+        calls.update(kwargs)
+
+    monkeypatch.setattr(infer, "inference_video_b200", fake_inference_video_b200)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer.py",
+            "--image_path", str(image_path),
+            "--metadata_path", str(metadata_path),
+            "--save_dir", str(save_dir),
+            "--model_paths", "/models/Wan2.2-TI2V-5B/",
+            "--lora_path", "/models/lora/step-100.safetensors",
+            "--image_latent_path", "/data/frame000_rdp_latent.pt",
+            "--save_diffusion_latent_path", "/data/frame000_diffusion_latent.pt",
+            "--skip_video_decode",
+            "--sparse-ratio", "0.5",
+            "--block-size", "2,2,3",
+            "--bsa-backend", "sdpa_chunked",
+            "--bsa-chunk-size", "64",
+            "--dump-attention-png", str(attention_png),
+        ],
+    )
+
+    infer.main()
+
+    assert calls["prompt"] == "test prompt"
+    assert calls["input_image_path"] == str(image_path)
+    assert calls["save_dir"] == str(save_dir)
+    assert calls["model_paths"] == "/models/Wan2.2-TI2V-5B/"
+    assert calls["lora_path"] == "/models/lora/step-100.safetensors"
+    assert calls["input_image_latent_path"] == "/data/frame000_rdp_latent.pt"
+    assert calls["save_diffusion_latent_path"] == "/data/frame000_diffusion_latent.pt"
+    assert calls["skip_video_decode"] is True
+    assert calls["block_size"] == (2, 2, 3)
+    assert calls["sparse_ratio"] == 0.5
+    assert calls["bsa_backend"] == "sdpa_chunked"
+    assert calls["bsa_chunk_size"] == 64
+    assert calls["dump_attention_png"] == str(attention_png)
+
+
+def test_internal_b200_entry_saves_latent_without_video_decode(monkeypatch, tmp_path):
+    from wan import wan_diffsynth
+
+    class FakePipe:
+        dit = object()
+
+        def __init__(self):
+            self.kwargs = None
+
+        def load_lora(self, *args, **kwargs):
+            raise AssertionError("lora should be skipped when lora_path=None")
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return torch.ones(1, 48, 21, 52, 30, dtype=torch.bfloat16)
+
+    pipe = FakePipe()
+    monkeypatch.setattr(wan_diffsynth.WanVideoPipeline, "from_pretrained", lambda **kwargs: pipe)
+
+    save_path = tmp_path / "diffusion_latent.pt"
+    result = wan_diffsynth.inference_video_b200(
+        input_image=Image.new("RGB", (480, 832)),
+        input_image_path="/data/frame000.png",
+        prompt="test prompt",
+        save_dir=None,
+        model_paths="/models/Wan2.2-TI2V-5B/",
+        lora_path=None,
+        sparse_ratio=0.0,
+        input_image_latent_path="/data/frame000_rdp_latent.pt",
+        save_diffusion_latent_path=str(save_path),
+        skip_video_decode=True,
+    )
+
+    assert result.shape == (1, 48, 21, 52, 30)
+    assert pipe.kwargs["input_image_latent"] == "/data/frame000_rdp_latent.pt"
+    assert pipe.kwargs["height"] == 832
+    assert pipe.kwargs["width"] == 480
+    assert pipe.kwargs["output_type"] == "latent"
+    assert pipe.kwargs["return_latents"] is False
+
+    saved = torch.load(save_path, map_location="cpu", weights_only=False)
+    assert saved["latent"].shape == (1, 48, 21, 52, 30)
+    assert saved["latent_role"] == "wan_diffusion_latent_after_denoise_unpatchified"
+    assert saved["image_path"] == "/data/frame000.png"
+    assert saved["image_latent_path"] == "/data/frame000_rdp_latent.pt"
+    assert saved["height"] == 832
+    assert saved["width"] == 480
 
 
 def test_bsa_inference_script_help_runs_from_repo_root():

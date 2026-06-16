@@ -109,6 +109,12 @@ def test_training_metrics_writer_records_loss_and_video_token_throughput(tmp_pat
         bsa_sparse_ratio=0.90,
         elapsed_seconds=10.0,
         step_seconds=10.0,
+        dmd_metrics={
+            "student_param_delta_norm": torch.tensor(0.01),
+            "fake_score_param_delta_norm": torch.tensor(0.02),
+            "teacher_param_delta_norm": 0.0,
+            "peak_memory_gb": 3.5,
+        },
     )
     writer.close()
 
@@ -128,6 +134,10 @@ def test_training_metrics_writer_records_loss_and_video_token_throughput(tmp_pat
     assert float(csv_rows[0]["tokens_per_hour"]) == 5896800.0
     assert float(csv_rows[0]["videos_per_day"]) == 17280.0
     assert json_row["bsa_sparse_ratio"] == 0.90
+    assert abs(json_row["student_param_delta_norm"] - 0.01) < 1e-8
+    assert abs(json_row["fake_score_param_delta_norm"] - 0.02) < 1e-8
+    assert json_row["teacher_param_delta_norm"] == 0.0
+    assert json_row["peak_memory_gb"] == 3.5
     assert "Loss" in html_path.read_text()
 
 

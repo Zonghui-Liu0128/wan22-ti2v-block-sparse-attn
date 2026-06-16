@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import json
 
 import torch
 from safetensors.torch import load_file
@@ -255,7 +256,7 @@ def test_launch_dmd_lora_training_task_uses_ttur_schedule(tmp_path):
         num_epochs=1,
         save_steps=None,
         fake_score_updates_per_generator_update=5,
-        disable_training_metrics=True,
+        disable_training_metrics=False,
         log_steps=1,
         enable_tensorboard=False,
         height=256,
@@ -278,3 +279,11 @@ def test_launch_dmd_lora_training_task_uses_ttur_schedule(tmp_path):
     assert model.student_steps == [0, 5]
     assert model.fake_steps == [0, 1, 2, 3, 4, 5]
     assert compute_wan_video_tokens(256, 256, 81, 16, (1, 2, 2)) == 1344
+
+    rows = [json.loads(line) for line in (tmp_path / "training_metrics.jsonl").read_text().splitlines()]
+    assert rows[0]["student_param_delta_norm"] > 0
+    assert rows[1]["student_param_delta_norm"] == 0.0
+    assert rows[-1]["student_param_delta_norm"] > 0
+    assert all(row["fake_score_param_delta_norm"] > 0 for row in rows)
+    assert all(row["teacher_param_delta_norm"] == 0.0 for row in rows)
+    assert "peak_memory_gb" in rows[0]

@@ -47,6 +47,9 @@ class TrainingMetricsWriter:
         "student_grad_norm",
         "fake_score_grad_norm",
         "teacher_grad_norm",
+        "student_param_delta_norm",
+        "fake_score_param_delta_norm",
+        "teacher_param_delta_norm",
         "lr_student",
         "lr_fake_score",
         "denoised_timestep_from",
@@ -72,6 +75,7 @@ class TrainingMetricsWriter:
         "videos_per_hour",
         "videos_per_day",
         "bsa_sparse_ratio",
+        "peak_memory_gb",
     ]
 
     def __init__(
@@ -150,6 +154,9 @@ class TrainingMetricsWriter:
         tokens_per_second = self.total_tokens / max(float(elapsed_seconds), 1e-9)
         effective_tokens_per_second = self.effective_total_tokens / max(float(elapsed_seconds), 1e-9)
         videos_per_second = self.total_samples / max(float(elapsed_seconds), 1e-9)
+        peak_memory_gb = dmd_metrics.get("peak_memory_gb")
+        if peak_memory_gb is None and torch.cuda.is_available():
+            peak_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
         row = {
             "step": int(step),
             "loss": _as_float(loss),
@@ -163,6 +170,9 @@ class TrainingMetricsWriter:
             "student_grad_norm": _as_float(dmd_metrics.get("student_grad_norm")),
             "fake_score_grad_norm": _as_float(dmd_metrics.get("fake_score_grad_norm")),
             "teacher_grad_norm": _as_float(dmd_metrics.get("teacher_grad_norm")),
+            "student_param_delta_norm": _as_float(dmd_metrics.get("student_param_delta_norm")),
+            "fake_score_param_delta_norm": _as_float(dmd_metrics.get("fake_score_param_delta_norm")),
+            "teacher_param_delta_norm": _as_float(dmd_metrics.get("teacher_param_delta_norm")),
             "lr_student": _as_float(dmd_metrics.get("lr_student")),
             "lr_fake_score": _as_float(dmd_metrics.get("lr_fake_score")),
             "denoised_timestep_from": _as_float(dmd_metrics.get("denoised_timestep_from")),
@@ -188,6 +198,7 @@ class TrainingMetricsWriter:
             "videos_per_hour": videos_per_second * 3600.0,
             "videos_per_day": videos_per_second * 86400.0,
             "bsa_sparse_ratio": None if bsa_sparse_ratio is None else float(bsa_sparse_ratio),
+            "peak_memory_gb": _as_float(peak_memory_gb),
         }
         self.rows.append(row)
 

@@ -25,6 +25,20 @@ def _grad_norm(parameters):
     return float(total.sqrt().item())
 
 
+def _clone_params(parameters):
+    return [param.detach().float().cpu().clone() for param in parameters]
+
+
+def _param_delta_norm(before, parameters):
+    if before is None:
+        return 0.0
+    total = torch.tensor(0.0)
+    for before_param, param in zip(before, parameters):
+        delta = param.detach().float().cpu() - before_param
+        total = total + delta.norm(2).pow(2)
+    return float(total.sqrt().item())
+
+
 def launch_dmd_lora_training_task(
     accelerator,
     dataset: torch.utils.data.Dataset,
@@ -130,20 +144,25 @@ def launch_dmd_lora_training_task(
             )
             student_loss = None
             student_grad_norm = 0.0
+            student_param_delta_norm = 0.0
             student_log = {}
             if student_update:
+                student_before = _clone_params(student_params)
                 optimizer_student.zero_grad(set_to_none=True)
                 student_loss, student_log = model.compute_student_dmd_loss(batch, outer_step=outer_step)
                 accelerator.backward(student_loss)
                 student_grad_norm = _grad_norm(student_params)
                 optimizer_student.step()
+                student_param_delta_norm = _param_delta_norm(student_before, student_params)
                 scheduler_student.step()
 
+            fake_score_before = _clone_params(fake_score_params)
             optimizer_fake_score.zero_grad(set_to_none=True)
             fake_score_loss, fake_log = model.compute_fake_score_loss(batch, outer_step=outer_step)
             accelerator.backward(fake_score_loss)
             fake_score_grad_norm = _grad_norm(fake_score_params)
             optimizer_fake_score.step()
+            fake_score_param_delta_norm = _param_delta_norm(fake_score_before, fake_score_params)
             scheduler_fake_score.step()
 
             metrics = {
@@ -155,6 +174,9 @@ def launch_dmd_lora_training_task(
                 "student_grad_norm": student_grad_norm,
                 "fake_score_grad_norm": fake_score_grad_norm,
                 "teacher_grad_norm": 0.0,
+                "student_param_delta_norm": student_param_delta_norm,
+                "fake_score_param_delta_norm": fake_score_param_delta_norm,
+                "teacher_param_delta_norm": 0.0,
                 "lr_student": scheduler_student.get_last_lr()[0],
                 "lr_fake_score": scheduler_fake_score.get_last_lr()[0],
             }

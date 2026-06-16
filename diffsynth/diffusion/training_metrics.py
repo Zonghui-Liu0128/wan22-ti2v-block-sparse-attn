@@ -38,6 +38,20 @@ class TrainingMetricsWriter:
         "step",
         "loss",
         "learning_rate",
+        "outer_step",
+        "student_update",
+        "fake_score_update",
+        "student_dmd_loss",
+        "fake_score_loss",
+        "dmd_gradient_norm",
+        "student_grad_norm",
+        "fake_score_grad_norm",
+        "teacher_grad_norm",
+        "lr_student",
+        "lr_fake_score",
+        "denoised_timestep_from",
+        "denoised_timestep_to",
+        "sampled_score_timestep",
         "elapsed_seconds",
         "step_seconds",
         "samples_this_step",
@@ -45,6 +59,12 @@ class TrainingMetricsWriter:
         "tokens_per_sample",
         "tokens_this_step",
         "total_tokens",
+        "dit_forward_count_student",
+        "dit_forward_count_fake",
+        "dit_forward_count_teacher",
+        "effective_tokens_this_step",
+        "effective_total_tokens",
+        "effective_tokens_per_second",
         "tokens_per_second",
         "tokens_per_hour",
         "tokens_per_day",
@@ -68,6 +88,7 @@ class TrainingMetricsWriter:
         self.log_steps = max(1, int(log_steps or 1))
         self.total_samples = 0
         self.total_tokens = 0
+        self.effective_total_tokens = 0
         self.start_time = time.perf_counter()
         self.last_time = self.start_time
         self.rows = []
@@ -105,11 +126,19 @@ class TrainingMetricsWriter:
         bsa_sparse_ratio: Optional[float] = None,
         elapsed_seconds: Optional[float] = None,
         step_seconds: Optional[float] = None,
+        dmd_metrics: Optional[dict] = None,
     ):
+        dmd_metrics = {} if dmd_metrics is None else dict(dmd_metrics)
         samples = int(samples)
         tokens_this_step = samples * self.tokens_per_sample
         self.total_samples += samples
         self.total_tokens += tokens_this_step
+        forward_count_student = int(dmd_metrics.get("dit_forward_count_student") or 0)
+        forward_count_fake = int(dmd_metrics.get("dit_forward_count_fake") or 0)
+        forward_count_teacher = int(dmd_metrics.get("dit_forward_count_teacher") or 0)
+        effective_forward_count = forward_count_student + forward_count_fake + forward_count_teacher
+        effective_tokens_this_step = tokens_this_step * effective_forward_count
+        self.effective_total_tokens += effective_tokens_this_step
 
         now = time.perf_counter()
         if elapsed_seconds is None:
@@ -119,11 +148,26 @@ class TrainingMetricsWriter:
         self.last_time = now
 
         tokens_per_second = self.total_tokens / max(float(elapsed_seconds), 1e-9)
+        effective_tokens_per_second = self.effective_total_tokens / max(float(elapsed_seconds), 1e-9)
         videos_per_second = self.total_samples / max(float(elapsed_seconds), 1e-9)
         row = {
             "step": int(step),
             "loss": _as_float(loss),
             "learning_rate": _as_float(learning_rate),
+            "outer_step": None if "outer_step" not in dmd_metrics else int(dmd_metrics["outer_step"]),
+            "student_update": dmd_metrics.get("student_update"),
+            "fake_score_update": dmd_metrics.get("fake_score_update"),
+            "student_dmd_loss": _as_float(dmd_metrics.get("student_dmd_loss")),
+            "fake_score_loss": _as_float(dmd_metrics.get("fake_score_loss")),
+            "dmd_gradient_norm": _as_float(dmd_metrics.get("dmd_gradient_norm")),
+            "student_grad_norm": _as_float(dmd_metrics.get("student_grad_norm")),
+            "fake_score_grad_norm": _as_float(dmd_metrics.get("fake_score_grad_norm")),
+            "teacher_grad_norm": _as_float(dmd_metrics.get("teacher_grad_norm")),
+            "lr_student": _as_float(dmd_metrics.get("lr_student")),
+            "lr_fake_score": _as_float(dmd_metrics.get("lr_fake_score")),
+            "denoised_timestep_from": _as_float(dmd_metrics.get("denoised_timestep_from")),
+            "denoised_timestep_to": _as_float(dmd_metrics.get("denoised_timestep_to")),
+            "sampled_score_timestep": _as_float(dmd_metrics.get("sampled_score_timestep")),
             "elapsed_seconds": float(elapsed_seconds),
             "step_seconds": float(step_seconds),
             "samples_this_step": samples,
@@ -131,6 +175,12 @@ class TrainingMetricsWriter:
             "tokens_per_sample": self.tokens_per_sample,
             "tokens_this_step": tokens_this_step,
             "total_tokens": self.total_tokens,
+            "dit_forward_count_student": forward_count_student,
+            "dit_forward_count_fake": forward_count_fake,
+            "dit_forward_count_teacher": forward_count_teacher,
+            "effective_tokens_this_step": effective_tokens_this_step,
+            "effective_total_tokens": self.effective_total_tokens,
+            "effective_tokens_per_second": effective_tokens_per_second,
             "tokens_per_second": tokens_per_second,
             "tokens_per_hour": tokens_per_second * 3600.0,
             "tokens_per_day": tokens_per_second * 86400.0,
@@ -149,9 +199,14 @@ class TrainingMetricsWriter:
             if self.tb_writer is not None:
                 self.tb_writer.add_scalar("train/loss", row["loss"], step)
                 self.tb_writer.add_scalar("train/tokens_per_second", row["tokens_per_second"], step)
+                self.tb_writer.add_scalar("train/effective_tokens_per_second", row["effective_tokens_per_second"], step)
                 self.tb_writer.add_scalar("train/videos_per_second", row["videos_per_second"], step)
                 if row["bsa_sparse_ratio"] is not None:
                     self.tb_writer.add_scalar("bsa/sparse_ratio", row["bsa_sparse_ratio"], step)
+                if row["student_dmd_loss"] is not None:
+                    self.tb_writer.add_scalar("dmd/student_dmd_loss", row["student_dmd_loss"], step)
+                if row["fake_score_loss"] is not None:
+                    self.tb_writer.add_scalar("dmd/fake_score_loss", row["fake_score_loss"], step)
         return row
 
     def close(self):

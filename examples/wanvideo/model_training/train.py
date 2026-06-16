@@ -13,6 +13,7 @@ from diffsynth.diffusion import *
 from diffsynth.models.wan_bsa import configure_wan_bsa, parse_bsa_block_size, set_wan_bsa_sparse_ratio
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import glob
+from examples.wanvideo.model_training.wan_dmd_lora_training import WanDMDLoRATrainingModule
 
 
 def bsa_sparse_ratio_for_step(step, start, target, warmup_steps):
@@ -73,6 +74,27 @@ def build_wan_special_operator_map(
     if "input_audio" in requested_keys:
         special_operator_map["input_audio"] = ToAbsolutePath(dataset_base_path) >> LoadAudio(sr=16000)
     return special_operator_map
+
+
+def add_wan_dmd_lora_config(parser):
+    parser.add_argument("--teacher_model_paths", type=str, default=None, help="Local Wan2.2 teacher model directory. Defaults to --model_paths.")
+    parser.add_argument("--teacher_lora_checkpoint", type=str, default=None, help="Frozen teacher LoRA checkpoint.")
+    parser.add_argument("--student_init_lora_checkpoint", type=str, default=None, help="Initial student LoRA checkpoint, usually the teacher/mock LoRA.")
+    parser.add_argument("--fake_score_init_lora_checkpoint", type=str, default=None, help="Initial fake_score LoRA checkpoint, usually the teacher/mock LoRA.")
+    parser.add_argument("--student_lora_rank", type=int, default=32, help="Student LoRA rank for DMD LoRA training.")
+    parser.add_argument("--fake_score_lora_rank", type=int, default=32, help="Fake score LoRA rank for DMD LoRA training.")
+    parser.add_argument("--dmd_denoising_steps", type=str, default="1000,750,500,250", help="Comma-separated DMD denoising timestep list.")
+    parser.add_argument("--real_guidance_scale", type=float, default=6.0, help="Teacher CFG scale for DMD real score.")
+    parser.add_argument("--fake_guidance_scale", type=float, default=0.0, help="Optional fake_score CFG scale.")
+    parser.add_argument("--fake_score_updates_per_generator_update", type=int, default=5, help="TTUR ratio: student updates every N outer steps; fake_score updates every step.")
+    parser.add_argument("--student_learning_rate", type=float, default=5e-7, help="Student LoRA learning rate.")
+    parser.add_argument("--fake_score_learning_rate", type=float, default=1e-7, help="Fake score LoRA learning rate.")
+    parser.add_argument("--student_beta1", type=float, default=0.9, help="Student AdamW beta1.")
+    parser.add_argument("--student_beta2", type=float, default=0.999, help="Student AdamW beta2.")
+    parser.add_argument("--fake_score_beta1", type=float, default=0.9, help="Fake score AdamW beta1.")
+    parser.add_argument("--fake_score_beta2", type=float, default=0.999, help="Fake score AdamW beta2.")
+    parser.add_argument("--fake_score_loss_type", type=str, choices=["x0"], default="x0", help="Fake score denoising target type.")
+    return parser
 
 
 class WanTrainingModule(DiffusionTrainingModule):
@@ -276,6 +298,7 @@ def wan_parser():
     parser.add_argument("--bsa_sparse_ratio_warmup_steps", type=int, default=0, help="Micro steps used to linearly warm sparse ratio from start to target.")
     parser.add_argument("--bsa_backend", type=str, choices=["flex", "sdpa_chunked"], default="flex", help="BSA attention backend.")
     parser.add_argument("--bsa_sdpa_chunk_size", type=int, default=64, help="Requested query-block chunk size for BSA sdpa_chunked backend.")
+    parser = add_wan_dmd_lora_config(parser)
     return parser
 
 
@@ -310,38 +333,71 @@ if __name__ == "__main__":
             framewise_decoding=args.framewise_decoding,
         )
     )
-    model = WanTrainingModule(
-        model_paths=args.model_paths,
-        model_id_with_origin_paths=args.model_id_with_origin_paths,
-        tokenizer_path=args.tokenizer_path,
-        audio_processor_path=args.audio_processor_path,
-        trainable_models=args.trainable_models,
-        lora_base_model=args.lora_base_model,
-        lora_target_modules=args.lora_target_modules,
-        lora_rank=args.lora_rank,
-        lora_checkpoint=args.lora_checkpoint,
-        preset_lora_path=args.preset_lora_path,
-        preset_lora_model=args.preset_lora_model,
-        use_gradient_checkpointing=args.use_gradient_checkpointing,
-        use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
-        extra_inputs=args.extra_inputs,
-        fp8_models=args.fp8_models,
-        offload_models=args.offload_models,
-        resume_from_checkpoint=args.resume_from_checkpoint,
-        remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
-        task=args.task,
-        device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
-        max_timestep_boundary=args.max_timestep_boundary,
-        min_timestep_boundary=args.min_timestep_boundary,
-        bsa_enable=args.bsa_enable,
-        bsa_block_size=args.bsa_block_size,
-        bsa_sparse_ratio=args.bsa_sparse_ratio,
-        bsa_sparse_ratio_start=args.bsa_sparse_ratio_start,
-        bsa_sparse_ratio_warmup_steps=args.bsa_sparse_ratio_warmup_steps,
-        bsa_backend=args.bsa_backend,
-        bsa_sdpa_chunk_size=args.bsa_sdpa_chunk_size,
-        redirect_common_files=not args.disable_common_file_redirect,
-    )
+    if args.task in ("dmd_lora", "dmd_lora:train"):
+        model = WanDMDLoRATrainingModule(
+            model_paths=args.model_paths,
+            model_id_with_origin_paths=args.model_id_with_origin_paths,
+            teacher_model_paths=args.teacher_model_paths,
+            tokenizer_path=args.tokenizer_path,
+            audio_processor_path=args.audio_processor_path,
+            lora_target_modules=args.lora_target_modules,
+            teacher_lora_checkpoint=args.teacher_lora_checkpoint,
+            student_init_lora_checkpoint=args.student_init_lora_checkpoint,
+            fake_score_init_lora_checkpoint=args.fake_score_init_lora_checkpoint,
+            student_lora_rank=args.student_lora_rank,
+            fake_score_lora_rank=args.fake_score_lora_rank,
+            dmd_denoising_steps=args.dmd_denoising_steps,
+            real_guidance_scale=args.real_guidance_scale,
+            fake_guidance_scale=args.fake_guidance_scale,
+            fake_score_loss_type=args.fake_score_loss_type,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+            extra_inputs=args.extra_inputs,
+            fp8_models=args.fp8_models,
+            offload_models=args.offload_models,
+            device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
+            bsa_enable=args.bsa_enable,
+            bsa_block_size=args.bsa_block_size,
+            bsa_sparse_ratio=args.bsa_sparse_ratio,
+            bsa_sparse_ratio_start=args.bsa_sparse_ratio_start,
+            bsa_sparse_ratio_warmup_steps=args.bsa_sparse_ratio_warmup_steps,
+            bsa_backend=args.bsa_backend,
+            bsa_sdpa_chunk_size=args.bsa_sdpa_chunk_size,
+            redirect_common_files=not args.disable_common_file_redirect,
+        )
+    else:
+        model = WanTrainingModule(
+            model_paths=args.model_paths,
+            model_id_with_origin_paths=args.model_id_with_origin_paths,
+            tokenizer_path=args.tokenizer_path,
+            audio_processor_path=args.audio_processor_path,
+            trainable_models=args.trainable_models,
+            lora_base_model=args.lora_base_model,
+            lora_target_modules=args.lora_target_modules,
+            lora_rank=args.lora_rank,
+            lora_checkpoint=args.lora_checkpoint,
+            preset_lora_path=args.preset_lora_path,
+            preset_lora_model=args.preset_lora_model,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+            extra_inputs=args.extra_inputs,
+            fp8_models=args.fp8_models,
+            offload_models=args.offload_models,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+            task=args.task,
+            device="cpu" if (args.initialize_model_on_cpu or args.enable_model_cpu_offload) else accelerator.device,
+            max_timestep_boundary=args.max_timestep_boundary,
+            min_timestep_boundary=args.min_timestep_boundary,
+            bsa_enable=args.bsa_enable,
+            bsa_block_size=args.bsa_block_size,
+            bsa_sparse_ratio=args.bsa_sparse_ratio,
+            bsa_sparse_ratio_start=args.bsa_sparse_ratio_start,
+            bsa_sparse_ratio_warmup_steps=args.bsa_sparse_ratio_warmup_steps,
+            bsa_backend=args.bsa_backend,
+            bsa_sdpa_chunk_size=args.bsa_sdpa_chunk_size,
+            redirect_common_files=not args.disable_common_file_redirect,
+        )
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
@@ -353,5 +409,7 @@ if __name__ == "__main__":
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "dmd_lora": launch_dmd_lora_training_task,
+        "dmd_lora:train": launch_dmd_lora_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
